@@ -129,9 +129,11 @@
     "password": "管理员密码",
     "passwordHint": "至少 8 位",
     "domain": "父域",
+    "consoleDomain": "控制台域名",
+    "dnsError": "暂时无法检查 DNS，请重试或确认配置后继续。",
     "dnsChecking": "检查解析…",
-    "dnsOk": "解析已就绪，控制台将是 {{domain}}",
-    "dnsMissing": "解析不到 —— 在你的 DNS 里加这两条：",
+    "dnsOk": "两个域名均有 DNS 记录，控制台为 {{domain}}；尚未验证指向和证书。",
+    "dnsMissing": "部分域名未解析，请检查这两条 DNS 记录：",
     "dnsPointTo": "两条都指向 {{host}}",
     "dnsOverride": "DNS 已经配好了，仍然继续",
     "useTempDomain": "用临时域名",
@@ -147,7 +149,7 @@
     "doneTitle": "好了",
     "doneBody": "管理员 {{email}} 已建好，控制台在 {{domain}}。首次打开时证书可能还在签发，报证书错就等一下再刷。",
     "doneClose": "这个入口已经关掉了，可以关掉本页。",
-    "doneDns": "注意：解析不到 {{probe}}，所以 console.<你填的域> 现在你也打不开。泛解析配好之前，只能改 hosts 或自己带 Host 头访问。"
+    "doneDns": "DNS 检查未全部通过，请检查工作空间泛解析和控制台域名。证书签发前不要输入登录凭据。"
   },
   "invite": {
     "subtitle": "你被邀请加入",

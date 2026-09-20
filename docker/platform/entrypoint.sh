@@ -3,7 +3,7 @@
 # 平台镜像的入口。子命令：
 #   migrate   跑数据库迁移
 #   seed      建第一个管理员（只在「还没有管理员」时生效，可重复跑）
-#   domain    改平台域名（写 DB，然后重启控制面自己）
+#   domain    改平台域名（写 DB，输出宿主重启命令）
 #   serve     起控制面（默认）
 #
 # compose 里 postgres 有 healthcheck，但那只保证「容器起来了」，不保证「现在能连」——
@@ -39,6 +39,26 @@ wait_for_db() {
 }
 
 case "${1:-serve}" in
+  storage-audit)
+    shift
+    exec node "$APP_DIR/dist/scripts/storage-audit.js" "$@"
+    ;;
+  node-agent)
+    pool_root=${HOST_STORAGE_ROOT:-/var/lib/dsh}
+    lock_path="$pool_root/.dsh-node.lock"
+    if [ ! -d "$pool_root" ] || [ -L "$pool_root" ] || [ -L "$lock_path" ]; then
+      echo "节点数据池或锁路径不安全，拒绝启动。" >&2
+      exit 1
+    fi
+    if [ -e "$lock_path" ] && [ ! -f "$lock_path" ]; then
+      echo "节点锁必须是普通文件。" >&2
+      exit 1
+    fi
+    # Never unlink this file: replacing its inode would permit a second lock holder.
+    umask 077
+    exec flock --exclusive --nonblock --conflict-exit-code 75 --no-fork "$lock_path" \
+      node "$APP_DIR/dist/src/runtime/node/main.js"
+    ;;
   migrate)
     wait_for_db
     exec node "$APP_DIR/dist/scripts/migrate.js"
@@ -57,7 +77,7 @@ case "${1:-serve}" in
     exec node "$APP_DIR/dist/src/index.js"
     ;;
   *)
-    echo "未知子命令：$1（可用：migrate / seed / domain / serve）" >&2
+    echo "未知子命令：$1（可用：migrate / seed / domain / serve / node-agent / storage-audit）" >&2
     exit 1
     ;;
 esac

@@ -27,7 +27,7 @@ const RENDERED: RenderedInstance = {
   machineName: 'dsh-instance-alice',
   hostname: 'alice.app.example.com',
   image: REF,
-  user: '0',
+  user: '1000:1000',
   workingDir: '/data',
   env: [],
   guestPort: 8080,

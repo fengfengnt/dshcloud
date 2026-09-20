@@ -17,6 +17,8 @@ export function registerForwardAuth(app: FastifyInstance, deps: ForwardAuthDeps)
         host,
         cookie: firstHeader(req.headers.cookie),
         originalUrl: `${proto}://${host}${uri}`,
+        method: firstHeader(req.headers['x-forwarded-method']) ?? 'GET',
+        ...(req.headers.origin === undefined ? {} : { origin: req.headers.origin }),
       },
       deps,
     )

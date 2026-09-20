@@ -1,4 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { safeLoginRedirect } from '@/lib/login-redirect.js'
 import { EyeIcon, EyeOffIcon, Loader2Icon } from 'lucide-react'
 import { useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -182,14 +183,5 @@ export default function LoginPage() {
 }
 
 function safeNext(next: string): string {
-  if (next.startsWith('/') && !next.startsWith('//')) return next
-  try {
-    const url = new URL(next)
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') return '/'
-    const here = window.location.hostname
-    if (url.hostname === here || url.hostname.endsWith(`.${here}`)) return url.toString()
-  } catch {
-    // ignore
-  }
-  return '/'
+  return safeLoginRedirect(next, window.location.origin)
 }

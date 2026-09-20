@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { DomainSchema } from './domain.js'
 
 /**
  * 平台运行时配置。**全部来自环境变量**，启动时校验一次，缺了就起不来。
@@ -19,20 +20,14 @@ const EnvSchema = z.object({
    * 非空会**压过**那份 DB 记录。装机不再写它（.env 里那两行恒为空），这条只服务
    * **本地开发**（`BASE_DOMAIN=lvh.me`）和手工覆盖。见 DECISIONS 的引导态装机那条。
    */
-  BASE_DOMAIN: z
-    .string()
-    .regex(/^$|^[a-z0-9.-]+$/, 'BASE_DOMAIN 只能是小写主机名')
-    .default(''),
+  BASE_DOMAIN: z.union([z.literal(''), DomainSchema]).default(''),
 
   /**
-   * 控制台自己的主机名，必须是 `BASE_DOMAIN` 的**子域**（`console.lvh.me`）。
+   * 控制台自己的主机名，可在独立域名上；默认使用 `console.<BASE_DOMAIN>`。
    * 父域本身不当主机名用——`<父域>` 这一层留给实例命名空间（`<slug>.<父域>`）。
    * 它决定 better-auth 的 baseURL、受信 Origin 和未登录时的跳转目标。与 `BASE_DOMAIN` 同为空。
    */
-  CONSOLE_DOMAIN: z
-    .string()
-    .regex(/^$|^[a-z0-9.-]+$/, 'CONSOLE_DOMAIN 只能是小写主机名')
-    .default(''),
+  CONSOLE_DOMAIN: z.union([z.literal(''), DomainSchema]).default(''),
 
   /** 派生实例 gate token。轮换后**必须重建实例容器**，否则桥 403。 */
   PLATFORM_SECRET: z.string().min(32, 'PLATFORM_SECRET 至少 32 字符'),
@@ -152,13 +147,11 @@ const EnvSchema = z.object({
     }
     return
   }
-  // 控制台是父域的专属子域（console.<父域>）；父域本身不当主机名用。
-  // 用 label 边界判定（`endsWith('.lvh.me')`），别让 `evil-lvh.me` 混过去。
-  if (!env.CONSOLE_DOMAIN.endsWith(`.${env.BASE_DOMAIN}`)) {
+  if (env.CONSOLE_DOMAIN === env.BASE_DOMAIN) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['CONSOLE_DOMAIN'],
-      message: `CONSOLE_DOMAIN 必须是 BASE_DOMAIN（${env.BASE_DOMAIN}）的子域，如 console.${env.BASE_DOMAIN}`,
+      message: 'CONSOLE_DOMAIN 不能与 BASE_DOMAIN 相同，工作空间父域不作为控制台主机名',
     })
   }
 })
@@ -227,8 +220,9 @@ export function withPlatformDomains(
   const baseDomain = stored?.baseDomain ?? ''
   const consoleDomain = stored?.consoleDomain ?? ''
   // 存的这一对也要过同一道规则；不过就当没配（fail closed，宁可停在引导态也不要拿它拼 URL）
-  if (baseDomain === '' || !consoleDomain.endsWith(`.${baseDomain}`)) {
+  const configured = EnvSchema.safeParse({ ...env, BASE_DOMAIN: baseDomain, CONSOLE_DOMAIN: consoleDomain })
+  if (baseDomain === '' || !configured.success) {
     return { env, bootstrap: true }
   }
-  return { env: { ...env, BASE_DOMAIN: baseDomain, CONSOLE_DOMAIN: consoleDomain }, bootstrap: false }
+  return { env: configured.data, bootstrap: false }
 }

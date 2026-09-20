@@ -2,6 +2,8 @@ node_modules/
 dist/
 coverage/
 *.tsbuildinfo
+__pycache__/
+*.py[cod]
 
 # 本地 agent 配置（含预置 skill），不进仓库
 .claude/

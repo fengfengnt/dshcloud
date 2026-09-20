@@ -20,8 +20,8 @@ import { randomBytes } from 'node:crypto'
 import { resolve4 } from 'node:dns/promises'
 import { createDb } from '../src/db/client.js'
 import { getPlatformSetting, savePlatformDomains } from '../src/db/platform-setting-repo.js'
-import { createDocker } from '../src/docker/client.js'
 import { CONSOLE_LABEL, loadEnv } from '../src/env.js'
+import { DomainSchema } from '../src/domain.js'
 
 function usage(message: string): never {
   console.error(
@@ -35,14 +35,14 @@ function usage(message: string): never {
 }
 
 /** 与引导页同一个形状（见 `http/setup-routes.ts` 的 BaseDomainSchema）。 */
-const HOSTNAME = /^[a-z0-9.-]+$/u
 
 async function main(): Promise<void> {
   const baseDomain = (process.argv[2] ?? '').trim()
 
   if (baseDomain === '') usage('没给父域')
-  if (!HOSTNAME.test(baseDomain)) usage(`父域只能是小写字母 / 数字 / . / -，给的是：${baseDomain}`)
-  if (!baseDomain.includes('.')) usage(`父域至少要两个标签（如 example.com），给的是：${baseDomain}`)
+  if (!DomainSchema.safeParse(baseDomain).success) usage('父域格式不合法')
+  const consoleDomain = (process.argv[3] ?? `${CONSOLE_LABEL}.${baseDomain}`).trim()
+  if (!DomainSchema.safeParse(consoleDomain).success || consoleDomain === baseDomain) usage('控制台域名格式不合法')
 
   const env = loadEnv()
   const { db, client } = createDb(env.DATABASE_URL)
@@ -57,10 +57,9 @@ async function main(): Promise<void> {
   }
 
   try {
-    const consoleDomain = `${CONSOLE_LABEL}.${baseDomain}`
     const current = await getPlatformSetting(db)
 
-    if (current?.baseDomain === baseDomain) {
+    if (current?.baseDomain === baseDomain && current.consoleDomain === consoleDomain) {
       console.log(`域名没变（还是 ${baseDomain}），什么都没做。`)
       return
     }
@@ -79,23 +78,9 @@ async function main(): Promise<void> {
 
     // 新域名是启动期配置，必须重启才生效。重启之后控制面在启动时重投影路由，
     // 新的 console.<父域> 那条才会出现。
-    const self = env.SELF_CONTAINER
-    if (self === '') {
-      console.log('没配 SELF_CONTAINER（本地开发？），手动重启控制面让新域名生效。')
-      return
-    }
-    try {
-      await createDocker().getContainer(self).restart()
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err)
-      console.warn(`警告：自动重启失败（${detail}）。`)
-      console.warn('域名已经写好，手动让它生效：')
-      console.warn('  docker compose -f /opt/dsh-cloud/prod.yml up -d control-plane')
-      return
-    }
-
-    console.log(`控制面已重启，控制台现在在 https://${consoleDomain}`)
-    console.log('旧域名上的会话已失效，请在新域名下重新登录。')
+    console.log('域名已保存。请在宿主执行以下命令使其生效：')
+    console.log('  docker compose -f /opt/dsh-cloud/prod.yml restart control-plane')
+    console.log(`重启后控制台为 https://${consoleDomain}，需要重新登录。`)
   } finally {
     // 不关连接池进程退不掉
     await client.end()

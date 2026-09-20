@@ -117,8 +117,18 @@ describe.runIf(process.env.DSH_SECURITY_INTEGRATION === '1')('instance storage a
       body: JSON.stringify({ email, password }),
     }))
     expect(login.status).toBe(200)
+    for (const value of login.headers.getSetCookie()) {
+      expect(value).toMatch(/^__Host-dsh_cloud\./)
+      expect(value).toMatch(/; Secure/i)
+      expect(value).toMatch(/; HttpOnly/i)
+      expect(value).not.toMatch(/; Domain=/i)
+    }
     const cookie = login.headers.getSetCookie().map(value => value.split(';')[0]).join('; ')
     expect((await auth.api.getSession({ headers: new Headers({ cookie }) }))?.user.role).toBe('admin')
+    for (const prefix of ['', '__Secure-']) {
+      const legacy = cookie.replaceAll('__Host-dsh_cloud.', `${prefix}dsh_cloud.`)
+      expect(await auth.api.getSession({ headers: new Headers({ cookie: legacy }) })).toBeNull()
+    }
     const target = await owner()
     for (const endpoint of ['impersonate-user', 'set-user-password', 'update-user']) {
       const response = await auth.handler(new Request(`https://console.app.example.com/api/auth/admin/${endpoint}`, {
@@ -127,6 +137,38 @@ describe.runIf(process.env.DSH_SECURITY_INTEGRATION === '1')('instance storage a
         body: JSON.stringify({ userId: target, newPassword: randomUUID(), data: { email: 'taken@example.test' } }),
       }))
       expect(response.status).toBe(403)
+    }
+  })
+
+  it('ordinary accounts cannot promote themselves through profile fields, admin APIs or identity headers', async () => {
+    const origin = 'https://console.app.example.com'
+    const auth = createAuth(loadEnv({
+      DATABASE_URL: 'postgres://unused', BASE_DOMAIN: 'app.example.com',
+      CONSOLE_DOMAIN: 'console.app.example.com',
+      PLATFORM_SECRET: randomUUID(), BETTER_AUTH_SECRET: randomUUID(),
+    }), database!.db)
+    const email = `${randomUUID()}@example.test`
+    const password = randomUUID()
+    await createUserWithPassword(auth, { email, password, name: 'Ordinary', role: 'user' })
+    const login = await auth.handler(new Request(`${origin}/api/auth/sign-in/email`, {
+      method: 'POST', headers: { origin, 'content-type': 'application/json' },
+      body: JSON.stringify({ email, password, role: 'admin' }),
+    }))
+    expect(login.status).toBe(200)
+    const cookie = login.headers.getSetCookie().map(value => value.split(';')[0]).join('; ')
+    const session = await auth.api.getSession({ headers: new Headers({ cookie }) })
+    expect(session?.user.role).toBe('user')
+    const id = session!.user.id
+    for (const endpoint of ['update-user', 'admin/set-role', 'admin/update-user']) {
+      const response = await auth.handler(new Request(`${origin}/api/auth/${endpoint}`, {
+        method: 'POST',
+        headers: { cookie, origin, 'content-type': 'application/json', 'x-user-role': 'admin', 'x-user-id': id },
+        body: JSON.stringify({ userId: id, role: 'admin', isAdmin: true, name: 'Still ordinary', data: { role: 'admin' } }),
+      }))
+      if (endpoint.startsWith('admin/')) expect(response.status).toBe(403)
+      const [persisted] = await database!.db.select().from(user).where(eq(user.id, id))
+      expect(persisted?.role).toBe('user')
+      expect((await auth.api.getSession({ headers: new Headers({ cookie }) }))?.user.role).toBe('user')
     }
   })
 

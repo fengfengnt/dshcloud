@@ -17,6 +17,14 @@ function render(over: Partial<TraefikOptions> = {}) {
 }
 
 describe('renderTraefikConfig', () => {
+  it('gateway mode routes every workspace through the authenticating proxy', () => {
+    const cfg = render({ gatewayAddress: 'http://127.0.0.1:32100' })
+    for (const service of Object.values(cfg.http.services!)) {
+      expect(service.loadBalancer.servers).toEqual([{ url: 'http://127.0.0.1:32100' }])
+    }
+    // The gateway needs the original cookie to authenticate; it strips it itself.
+    for (const router of Object.values(cfg.http.routers!)) expect(router.middlewares).toEqual([])
+  })
   it('每条路由都挂了 forward-auth（漏挂就是洞，且不会报错）', () => {
     const cfg = render()
     const routers = Object.values(cfg.http.routers!)

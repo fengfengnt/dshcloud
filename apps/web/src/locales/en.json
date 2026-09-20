@@ -129,9 +129,11 @@
     "password": "Administrator password",
     "passwordHint": "At least 8 characters",
     "domain": "Parent domain",
+    "consoleDomain": "Console domain",
+    "dnsError": "DNS could not be checked. Retry or confirm the configuration before continuing.",
     "dnsChecking": "Checking DNS…",
-    "dnsOk": "DNS is ready — the console will be at {{domain}}",
-    "dnsMissing": "Not resolving yet — add these two records to your DNS:",
+    "dnsOk": "Both domains have DNS records. Console: {{domain}}. Routing and certificates have not been verified.",
+    "dnsMissing": "Some domains are not resolving. Check these two DNS records:",
     "dnsPointTo": "both pointing at {{host}}",
     "dnsOverride": "DNS is set up — continue anyway",
     "useTempDomain": "Use a temporary domain",
@@ -147,7 +149,7 @@
     "doneTitle": "Done",
     "doneBody": "Administrator {{email}} is created. The console is at {{domain}}. On the first visit the certificate may still be issuing — reload if you see a certificate error.",
     "doneClose": "This entry point is closed — you can close this tab.",
-    "doneDns": "Note: {{probe}} does not resolve, so console.<your domain> is unreachable too. Until the wildcard record is in place, use a hosts entry or send the Host header yourself."
+    "doneDns": "DNS checks did not all pass. Check the workspace wildcard and console domain records. Do not enter login credentials before a valid certificate is available."
   },
   "invite": {
     "subtitle": "You have been invited",

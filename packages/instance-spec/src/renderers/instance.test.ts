@@ -65,6 +65,14 @@ describe('renderInstance', () => {
     expect(r.guestPort).toBe(BRIDGE_PORT)
   })
 
+  it('运行用户是固定非 root', () => {
+    const r = renderInstance(spec, ctx)
+
+    // 写死字面量而不是 `${INSTANCE_UID}:${INSTANCE_GID}`：改这个号意味着存量数据的属主要
+    // 重新迁一遍，得是一次有人看着的改动，不该跟着常量悄悄漂过去
+    expect(r.user).toBe('1000:1000')
+  })
+
   it('数据卷标识**不透明**：宿主路径不进渲染结果', () => {
     const r = renderInstance(spec, ctx)
     const asText = JSON.stringify(r)

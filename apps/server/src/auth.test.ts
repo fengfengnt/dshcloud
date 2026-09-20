@@ -22,6 +22,18 @@ function env(overrides: Record<string, string> = {}): Env {
 }
 
 describe('引导态下的认证', () => {
+  it('HTTPS console credentials use host-only protected cookies', async () => {
+    const { db, client } = createDb('postgres://localhost:5432/nonexistent')
+    try {
+      const auth = createAuth(env({ BASE_DOMAIN: 'app.example.com', CONSOLE_DOMAIN: 'console.app.example.com' }), db)
+      const context = await auth.$context
+      for (const cookie of Object.values(context.authCookies)) {
+        expect(cookie.name).toMatch(/^__Host-dsh_cloud\./)
+        expect(cookie.attributes).toMatchObject({ secure: true, httpOnly: true, path: '/', sameSite: 'lax' })
+        expect(cookie.attributes.domain).toBeUndefined()
+      }
+    } finally { await client.end() }
+  })
   it('域名空 → baseURL 兜到占位值，绝不出现裸协议', () => {
     expect(authBaseUrl(env())).toBe('http://127.0.0.1:3000')
     // 对照：配好域名就是真的控制台地址

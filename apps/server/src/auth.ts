@@ -21,15 +21,11 @@ export function authBaseUrl(env: Env): string {
 /**
  * 平台账号体系。**只服务控制面**（`CONSOLE_DOMAIN`）。
  *
- * cookie 必须覆盖父域，否则 forward-auth 在实例子域上读不到 → 数据面无法认证
- * （见 docs/ARCHITECTURE.md §七，那里的 CSRF 要求同样成立）。
+ * 控制台 Cookie 不发送到工作空间；工作空间由网关兑换独立会话。
  *
- * `opts.bootstrap`：调用方明确知道"还没配域名"。**但它只是把意图说清楚** ——
- * 真正决定"要不要用占位 baseURL / 关掉跨子域 cookie"的是 `CONSOLE_DOMAIN` 是否为空
- * （两者在引导态必须同时成立，否则构造出来的上下文不可用）。
+ * 引导态仍由 authBaseUrl 提供占位地址；所有模式均禁止跨子域 Cookie。
  */
-export function createAuth(env: Env, db: Db, opts: { bootstrap?: boolean } = {}) {
-  const bootstrap = opts.bootstrap === true || env.CONSOLE_DOMAIN === ''
+export function createAuth(env: Env, db: Db, _opts: { bootstrap?: boolean } = {}) {
   return betterAuth({
     secret: env.BETTER_AUTH_SECRET,
     baseURL: authBaseUrl(env),
@@ -52,10 +48,10 @@ export function createAuth(env: Env, db: Db, opts: { bootstrap?: boolean } = {})
     ],
     advanced: {
       // 显式指定，别让 better-auth 按请求 Host 猜（实例子域上的请求也会打到它）
-      cookiePrefix: 'dsh_cloud',
-      // 必须覆盖**父域**（控制台 + 所有实例子域），否则 forward-auth 在
-      // `<slug>.<BASE_DOMAIN>` 上读不到会话（§七）。引导态还没有父域，关掉。
-      crossSubDomainCookies: bootstrap ? { enabled: false } : { enabled: true, domain: `.${env.BASE_DOMAIN}` },
+      cookiePrefix: env.PUBLIC_SCHEME === 'https' ? '__Host-dsh_cloud' : 'dsh_cloud',
+      // Supply __Host ourselves; better-auth otherwise prepends __Secure-.
+      useSecureCookies: false,
+      crossSubDomainCookies: { enabled: false },
       defaultCookieAttributes: {
         httpOnly: true,
         secure: env.PUBLIC_SCHEME === 'https',

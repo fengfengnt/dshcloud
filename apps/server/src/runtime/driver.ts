@@ -31,6 +31,8 @@ export class StorageExistsError extends Error {}
 /** 数据卷不存在。`ensureStorage` **绝不静默新建**：那会把「数据丢了」伪装成「一切正常」。 */
 export class StorageNotFoundError extends Error {}
 
+export class StorageIncompleteError extends Error {}
+
 /**
  * 运行时驱动：**唯一**接触具体运行时的接缝。
  *
@@ -94,6 +96,18 @@ export interface RuntimeDriver {
   createStorage(key: string, sizeMb: number): Promise<void>
   /** 确认数据卷在。不在就抛 `StorageNotFoundError`，**绝不新建**。 */
   ensureStorage(key: string): Promise<void>
+  /**
+   * 把这一份数据的属主**递归**改成 `uid:gid`。
+   *
+   * 为什么要平台侧来改：工作负载以固定非 root 跑（`INSTANCE_UID`），而数据目录是 root 建的
+   * —— 属主不对，实例照常起、入口照常响应，agent 跑到一半才写不了盘（**静默失败**）。
+   * 容器内降权做不到：`CapDrop: ALL` 下 `setpriv` / `su` / `gosu` 全是 `EPERM`（见 D29），
+   * 所以只有在建容器时由运行时施加这一条路。
+   *
+   * **幂等，而且必须可重入**：回滚会把升级前的旧数据（root 属主）盖回来，那时必须重新迁一遍
+   * —— 判据是目录的**实际属主**，不是库里的某条状态（记状态的那种做法在这里会骗人）。
+   */
+  chownStorage(key: string, uid: number, gid: number): Promise<void>
   /** 删掉这一块卷。幂等。**只删这一个 key** —— 快照卷是上层的事（见 `DataStore`）。 */
   removeStorage(key: string): Promise<void>
   /**

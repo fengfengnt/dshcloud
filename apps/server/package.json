@@ -12,7 +12,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "pnpm --filter @dsh-cloud/instance-spec build",
     "test": "vitest run",
-    "test:security": "DSH_SECURITY_INTEGRATION=1 vitest run src/db/instance-repo.integration.test.ts src/db/invitation-repo.integration.test.ts src/instance/traefik.integration.test.ts",
+    "test:security": "DSH_SECURITY_INTEGRATION=1 vitest run src/db/instance-repo.integration.test.ts src/db/invitation-repo.integration.test.ts src/db/workspace-access-repo.integration.test.ts src/instance/traefik.integration.test.ts",
     "db:generate": "node --env-file-if-exists=.env.local node_modules/drizzle-kit/bin.cjs generate",
     "db:migrate": "node --env-file-if-exists=.env.local node_modules/drizzle-kit/bin.cjs migrate",
     "db:seed": "node --env-file-if-exists=.env.local --import tsx scripts/seed.ts"
@@ -26,13 +26,17 @@
     "dockerode": "^4.0.4",
     "drizzle-orm": "^0.45.2",
     "fastify": "^5.12.3",
+    "http-proxy": "^1.18.1",
     "postgres": "^3.4.9",
+    "set-cookie-parser": "^3.1.2",
     "yaml": "^2.9.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/dockerode": "^3.3.34",
+    "@types/http-proxy": "^1.17.17",
     "@types/node": "^22.10.2",
+    "@types/set-cookie-parser": "^2.4.10",
     "drizzle-kit": "^0.31.10",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",

@@ -15,7 +15,7 @@ export interface BootDeps {
 /**
  * 平台启动时的第一步：**判僵尸 → 校验数据 → 恢复实例**。
  *
- * ① **把停在 provisioning 的行判死**（见下面注释）。
+ * ① 把中断的创建、恢复或删除标为错误，保留现场供核查。
  *
  * ② **校验所有实例的数据**。数据是**宿主存储池上带项目配额的目录**（池化形态；开发机没有池子时
  *    退回命名卷，见 `DockerDriver.createStorage`），**这条检查必须留着**：
@@ -30,18 +30,17 @@ export interface BootDeps {
 export async function bootInstances(deps: BootDeps): Promise<void> {
   const rows = await deps.listInstances()
 
-  // ① 先判僵尸：`createInstanceRecord` 先落 provisioning 行、后起实例，进程在这个窗口里
-  //    挂掉就留下**谁也不管**的行——对账器跳过非 running/stopped，下面的恢复只拉 running。
-  //    自动 pull 之后窗口从秒级变成分钟级，必须显式收敛（判死，等人 restart）。
+  // Without a durable operation phase, neither restarting nor deleting is a safe recovery guess.
+  const interrupted = new Set(['provisioning', 'removing'])
   for (const row of rows) {
-    if (row.status !== 'provisioning') continue
-    deps.warn(`实例 ${row.slug} 停在 provisioning：上次创建被平台重启中断`)
-    await deps.markError(row.id, '平台重启中断了创建，请重试')
+    if (!interrupted.has(row.status)) continue
+    deps.warn(`实例 ${row.slug} 停在 ${row.status}：上次操作被平台重启中断，未自动恢复`)
+    await deps.markError(row.id, `平台重启中断了操作（${row.status}），请先检查数据、快照和恢复副本，再决定恢复方式`)
   }
 
   const ready = new Set<string>()
   for (const row of rows) {
-    if (row.status === 'provisioning') continue
+    if (interrupted.has(row.status)) continue
     try {
       await deps.ensure(row.storageKey)
       ready.add(row.id)

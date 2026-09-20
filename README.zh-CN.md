@@ -1,3 +1,5 @@
+> **使用限制：仅限在全新 Linux 环境中测试，以及本地开发使用。请勿用于生产环境，也不要安装到已运行其他业务的主机上。**
+
 <p align="center">
   <picture>
     <source media="(prefers-reduced-motion: reduce) and (prefers-color-scheme: dark)" srcset="apps/web/public/brand/dshcloud-lockup-dark.svg">
@@ -33,7 +35,11 @@
 
 管理员完成平台部署后，可通过邀请链接添加用户。每位用户均可在授权配额内创建和管理多个工作空间。
 
-> **项目处于早期开发阶段。** 当前适合评估与开发，尚不具备生产可用性；部署验证和安全工作仍有未决项。部署至公网前，请先阅读[架构与安全模型](docs/ARCHITECTURE.md)中的权限边界与运行限制。
+> **项目处于早期开发阶段 —— 请先在测试机上跑。** 当前适合评估与开发，尚不具备生产可用性；部署验证和安全工作仍有未决项。部署至公网前，请先阅读[架构与安全模型](docs/ARCHITECTURE.md)中的权限边界与运行限制。
+>
+> **安装脚本会改动它所在的这台机器**，装完之后平台也持续在改 —— 它会写存储池与 `/etc/fstab` 挂载项、把部署资产落到 `/opt/dsh-cloud`、占用 `80` / `443` 端口，并以能访问 Docker socket 的身份跑容器。工作空间的数据放在宿主文件系统上，容器有权限改它。请用一台你愿意重装的机器。
+>
+> 接口、配置与磁盘上的布局都还在变。升级前请关注仓库里的发布说明。
 
 ## 与本地运行的区别
 
@@ -206,7 +212,14 @@ curl -fsSL "https://raw.githubusercontent.com/eskim2001/dshcloud/main/scripts/in
 
 </details>
 
-> 项目处于早期开发阶段：部署验证与安全工作仍有未决项，公网部署前请先读[架构与安全模型](docs/ARCHITECTURE.md)里的权限边界与运行限制（§五、§八）。
+**安装脚本会在这台机器上改什么**
+
+- 在 `--pool-root`（默认 `/var/lib/dsh`）建存储池。该路径若还不是以 `pquota` 挂载的 XFS，脚本会写一块 loopback XFS 镜像，并往 `/etc/fstab` 加一条挂载项。
+- 把部署资产与密钥写到 `/opt/dsh-cloud`。
+- 以容器方式起入口、Postgres 与控制面，并在宿主上占用 `80` 与 `443` 端口。
+- 每次安装/升级都配置仅以平台网桥为来源的 INPUT/FORWARD 规则与 systemd 开机单元；失败停止安装。阻断工作空间访问宿主、私网、Docker 网桥及主动 IPv6 出站，因此内网模型/Git 服务会受影响。`--harden-host` 仅保留为旧命令兼容参数。启动顺序和防火墙重载保护仍待完成及 Linux 验证，见[发布门槛](docs/PRODUCTION-READINESS.md)。
+
+节点服务持有 Docker socket 与 `CAP_SYS_ADMIN`，等价于宿主 root。控制面通过本地 socket 调用节点服务，仍有广泛的实例管理权限。见[部署](docker/platform/README.md)。
 
 ### 本地开发
 

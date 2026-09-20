@@ -7,12 +7,12 @@
 #
 # 子命令：install（默认）/ update / uninstall
 #
-# 它做四件事，顺序不能换（另有第五件，是**可选**的：`--harden-host`）：
+# 安装顺序：
 #   ① 预检（环境 / 端口 / **存储能力**）
 #   ② 在**宿主上**预置存储池并写持久化 —— 容器里建池宿主看不见（见 D35）
 #   ③ 从镜像里取部署资产到 /opt/dsh-cloud，渲染 Traefik 配置
-#   ④ 起 Postgres → 迁移 → 起控制面与入口 → **打印一行引导地址**
-#   ⑤（可选）在宿主 INPUT 上拦一道「实例容器 → 宿主自己」，见 `harden_host`
+#   ④ 安装宿主 INPUT / FORWARD 网络边界及开机加载单元
+#   ⑤ 起 Postgres → 迁移 → 起控制面与入口 → **打印一行引导地址**
 #
 # **账号和域名不归它管**：都在那行地址打开的引导页里配。安装这一步因此一个问题都不问。
 #
@@ -39,8 +39,6 @@ CONTROL_PORT=
 POSTGRES_PORT=
 PURGE=0
 FORCE_SECRETS=0
-# 默认不碰宿主防火墙：这台机器上可能还有别的容器要访问宿主上的服务，一刀切会误伤（见 harden_host）
-HARDEN_HOST=0
 
 # 由 fetch_assets 填：拉到的镜像 digest（写进 .installed-version，标签漂移时靠它认版本）
 IMAGE_DIGEST=
@@ -76,9 +74,10 @@ usage() {
                      取第一台空闲的
   --pool-root <路径> 存储池根，默认 /var/lib/dsh
   --pool-size-mb <MB> 需要自动建 loopback 池时用；省略取该文件系统的 80%
-  --harden-host      在宿主 INPUT 上拦住「实例容器 → 宿主自己」的入站（默认不做）。
-                     ⚠️ 代价是**这台机器上所有容器**都再也够不到宿主的监听，别在有别的
-                     容器要访问宿主服务的机器上开。开关生效后重启也会自动装回。
+  --harden-host      兼容旧命令；安装和升级现在始终配置宿主网络边界。
+                     限制实例访问宿主/内网/容器网桥，允许公网 IPv4 TCP/UDP，拒绝主动 IPv6 出站。
+                     仅匹配平台专用 dshw 网桥及带归属标签的旧实例网桥。
+                     需要 systemd；开机加载配置失败则停止安装。完整加固部署仍需额外验收。
   --purge            （uninstall）连 Postgres 卷、存储池、状态目录一起删 —— **不可恢复**
   -h, --help         显示这段
 
@@ -99,7 +98,7 @@ while [ $# -gt 0 ]; do
     --pool-root) POOL_ROOT=${2:?--pool-root 后面要给路径}; shift 2 ;;
     --pool-size-mb) POOL_SIZE_MB=${2:?--pool-size-mb 后面要给数字}; shift 2 ;;
     --wizard-port) WIZARD_PORT=${2:?--wizard-port 后面要给端口号}; shift 2 ;;
-    --harden-host) HARDEN_HOST=1; shift ;;
+    --harden-host) shift ;;
     --purge) PURGE=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) die "认不出的参数：$1（-h 看用法）" ;;
@@ -206,6 +205,8 @@ preflight() {
   [ "$(id -u)" = 0 ] || die "要 root（要建挂载点、写 fstab、装存储池）。用 sudo 跑。"
 
   [ "$(uname -s)" = Linux ] || die "只支持 Linux。macOS / Docker Desktop 请用仓库里的本地开发栈（见 docker/compose/README.md）。"
+
+  require_host_firewall
 
   if [ -f /.dockerenv ] || grep -qa 'docker\|containerd' /proc/1/cgroup 2>/dev/null; then
     die "看起来在**容器里**跑。本脚本要在宿主机上执行：它要建挂载、写 fstab、并让 Docker 用宿主路径挂卷。"
@@ -339,7 +340,7 @@ provision_pool() {
   log "存储池就绪：$POOL_ROOT（loopback XFS + pquota，已写进 fstab）"
 }
 
-# ── ②b 宿主侧加固（可选，--harden-host）────────────────────────────────
+# ── ②b 宿主网络基线 ─────────────────────────────────
 # 实例容器从网桥的**网关**后面出去，发给宿主自己的包（sshd:22，以及任何绑 0.0.0.0 的东西）
 # 走的是 INPUT，默认一路放行。Docker **没有**原生开关能只关掉这一条 ——
 # `com.docker.network.bridge.gateway_mode_ipv4=isolated` 会连网桥地址一起去掉，而它**必须**
@@ -347,34 +348,100 @@ provision_pool() {
 # 所以只剩两条路：接受「实例够得到宿主上的服务」，或者在宿主 INPUT 上拦一道。这是后者。
 #
 # 拦法按**接口**、不按网段：网段是 Docker 动态分的（还跟操作者自己的网络共享地址池），而
-# 「来自容器网桥接口」正好就是那个威胁面。出网不受影响（那是 FORWARD），入口转发到实例也不
-# 受影响（那是宿主发起的，走 OUTPUT），发布到宿主回环的实例端口同样不受影响。
+# 「来自容器网桥接口」正好就是那个威胁面。FORWARD 另外限制私网和容器目的地，
+# 保留公网 IPv4 TCP/UDP。宿主主动访问实例的回复通过 conntrack REPLY 放行。
 HARDEN_CHAIN=dsh-cloud-input
 HARDEN_UNIT=/etc/systemd/system/dsh-cloud-harden.service
 
+require_host_firewall() {
+  have systemctl && [ -d /run/systemd/system ] || die "生产安装需要运行中的 systemd，以加载宿主网络边界。"
+  have iptables && have iptables-restore || die "生产安装需要 iptables 和 iptables-restore。"
+  if [ -d /proc/sys/net/ipv6 ]; then
+    have ip6tables && have ip6tables-restore || die "IPv6 已启用，需要 ip6tables 和 ip6tables-restore。"
+  fi
+}
+
 harden_host() {
-  STEP='宿主侧加固（--harden-host）'
-  have iptables || die "--harden-host 需要 iptables，这台机器上没有。"
+  STEP='宿主网络基线'
+  require_host_firewall
 
   # 规则单独落成脚本：systemd 单元开机直接跑它，安装脚本和开机走的是同一份逻辑。
   cat >"$STATE_DIR/harden-host.sh" <<'EOS'
 #!/usr/bin/env bash
-# 由 scripts/install.sh --harden-host 生成。**可重复执行**（每次先清空自己的链再重建）。
+# 由 scripts/install.sh 生成。**可重复执行**（每次先清空自己的链再重建）。
 #
-# 拦住「容器 → 宿主自己」的入站。出网不受影响（走 FORWARD），宿主发起的转发也不受影响（走 OUTPUT）。
+# Scope INPUT and FORWARD restrictions to platform bridges; preserve unrelated workloads.
 set -euo pipefail
 CHAIN=dsh-cloud-input
+FORWARD_CHAIN=dsh-cloud-forward
+EGRESS_CHAIN=dsh-cloud-egress
 command -v iptables >/dev/null 2>&1 || { echo "缺 iptables" >&2; exit 1; }
+command -v docker >/dev/null 2>&1 || { echo "缺 docker" >&2; exit 1; }
+families=(iptables)
+if [[ -d /proc/sys/net/ipv6 ]]; then
+  command -v ip6tables >/dev/null 2>&1 || { echo "IPv6 已启用但缺 ip6tables，拒绝仅加固 IPv4" >&2; exit 1; }
+  ip6tables -L INPUT -n >/dev/null
+  families+=(ip6tables)
+fi
 
-if ! iptables -L "$CHAIN" -n >/dev/null 2>&1; then iptables -N "$CHAIN"; fi
-iptables -F "$CHAIN"
-# `docker+` 盖 docker0 / docker_gwbridge；`br-+` 盖每实例一个的 `br-<网络ID前12位>`。
-# **故意不写 `br+`**：那会连 `br0`（宿主自己的 LAN 桥）一起匹配，把整个局域网拦在门外。
-iptables -A "$CHAIN" -i docker+ -j DROP
-iptables -A "$CHAIN" -i br-+ -j DROP
-# INPUT 里只留一条跳转，并且放在**最前面**：前面若有一条 ACCEPT，就轮不到这条链了。
-while iptables -D INPUT -j "$CHAIN" 2>/dev/null; do :; done
-iptables -I INPUT 1 -j "$CHAIN"
+# Validate ownership before touching rules, including reserved-prefix collisions.
+networks=$(docker network ls --filter driver=bridge --format '{{.ID}}')
+bridges=()
+destination_bridges=()
+for network in $networks; do
+  record=$(docker network inspect --format '{{.Id}}|{{.Name}}|{{index .Labels "dsh.cloud/managed"}}|{{index .Labels "dsh.cloud/instance"}}|{{index .Options "com.docker.network.bridge.name"}}' "$network")
+  IFS='|' read -r id name managed slug bridge <<<"$record"
+  if [[ -z "$bridge" || "$bridge" = '<no value>' ]]; then
+    if [[ "$name" = bridge ]]; then bridge=docker0; else bridge="br-${id:0:12}"; fi
+  fi
+  [[ "$bridge" =~ ^[a-zA-Z0-9_.-]{1,15}$ ]] || { echo "非法 Docker 网桥名，拒绝生成规则" >&2; exit 1; }
+  destination_bridges+=("$bridge")
+  if [[ "$managed" = true && "$slug" =~ ^[a-z0-9][a-z0-9-]*$ && "$name" = "dsh-net-$slug" ]]; then
+    if [[ -z "$bridge" || "$bridge" = '<no value>' ]]; then bridge="br-${id:0:12}"; fi
+    [[ "$bridge" =~ ^[a-zA-Z0-9_.-]{1,15}$ ]] || { echo "非法平台网桥名" >&2; exit 1; }
+    bridges+=("$bridge")
+  elif [[ "$bridge" = dshw* ]]; then
+    echo "其他业务占用了平台保留网桥前缀 dshw，拒绝修改防火墙" >&2
+    exit 1
+  fi
+done
+
+for firewall in "${families[@]}"; do
+  command -v "$firewall-restore" >/dev/null 2>&1 || { echo "缺 $firewall-restore" >&2; exit 1; }
+done
+for firewall in "${families[@]}"; do
+  # Count only our exact jumps; the transaction never flushes the shared INPUT chain.
+  input_rules=$("$firewall" -S INPUT)
+  jumps=$(printf '%s\n' "$input_rules" | grep -Fxc -- "-A INPUT -j $CHAIN" || true)
+  forward_rules=$("$firewall" -S FORWARD)
+  forward_jumps=$(printf '%s\n' "$forward_rules" | grep -Fxc -- "-A FORWARD -j $FORWARD_CHAIN" || true)
+  {
+    printf '*filter\n:%s - [0:0]\n-F %s\n' "$CHAIN" "$CHAIN"
+    printf ':%s - [0:0]\n:%s - [0:0]\n-F %s\n-F %s\n' "$FORWARD_CHAIN" "$EGRESS_CHAIN" "$FORWARD_CHAIN" "$EGRESS_CHAIN"
+    printf '%s\n' "-A $CHAIN -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN"
+    printf '%s\n' "-A $CHAIN -i dshw+ -j DROP"
+    for bridge in "${bridges[@]}"; do printf '%s\n' "-A $CHAIN -i $bridge -j DROP"; done
+    for ((i=0; i<jumps; i++)); do printf '%s\n' "-D INPUT -j $CHAIN"; done
+    printf '%s\n' "-I INPUT 1 -j $CHAIN"
+    printf '%s\n' "-A $FORWARD_CHAIN -i dshw+ -j $EGRESS_CHAIN"
+    for bridge in "${bridges[@]}"; do printf '%s\n' "-A $FORWARD_CHAIN -i $bridge -j $EGRESS_CHAIN"; done
+    printf '%s\n' "-A $EGRESS_CHAIN -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN"
+    if [[ "$firewall" = iptables ]]; then
+      # These output-interface checks only run for packets originating on platform bridges.
+      for bridge in dshw+ docker+ br-+ "${destination_bridges[@]}"; do
+        printf '%s\n' "-A $EGRESS_CHAIN -o $bridge -j DROP"
+      done
+      for destination in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4; do
+        printf '%s\n' "-A $EGRESS_CHAIN -d $destination -j DROP"
+      done
+      printf '%s\n' "-A $EGRESS_CHAIN -p tcp -j RETURN" "-A $EGRESS_CHAIN -p udp -j RETURN"
+    fi
+    # IPv6 outbound is denied until a separately validated dual-stack policy exists.
+    printf '%s\n' "-A $EGRESS_CHAIN -j DROP"
+    for ((i=0; i<forward_jumps; i++)); do printf '%s\n' "-D FORWARD -j $FORWARD_CHAIN"; done
+    printf '%s\n' "-I FORWARD 1 -j $FORWARD_CHAIN" 'COMMIT'
+  } | "$firewall-restore" --wait 5 --noflush
+done
 EOS
   chmod 755 "$STATE_DIR/harden-host.sh"
   "$STATE_DIR/harden-host.sh"
@@ -382,12 +449,12 @@ EOS
 
   # iptables 规则不落盘，重启就没了 —— 一个"重启后静默失效"的加固比没有这个开关更坏。
   # 用 systemd 单元而不是 iptables-persistent：不引新包，也不去改操作者自己那份防火墙配置。
-  if have systemctl; then
-    cat >"$HARDEN_UNIT" <<EOS
+  cat >"$HARDEN_UNIT" <<EOS
 [Unit]
-Description=dsh-cloud：拦住「实例容器 → 宿主自己」的入站（--harden-host）
-# 规则按**接口名**匹配，接口存不存在都能装，所以不依赖 docker.service
-After=network.target
+Description=dsh-cloud workspace host and egress firewall
+# Legacy bridges are discovered through Docker labels before installing rules.
+Requires=docker.service
+After=network.target docker.service
 
 [Service]
 Type=oneshot
@@ -397,36 +464,38 @@ ExecStart=$STATE_DIR/harden-host.sh
 [Install]
 WantedBy=multi-user.target
 EOS
-    systemctl daemon-reload
-    if ! systemctl enable --now dsh-cloud-harden.service >/dev/null 2>&1; then
-      warn "启用 dsh-cloud-harden.service 失败：规则这次已生效，但**重启后会丢**。查：systemctl status dsh-cloud-harden"
-    fi
-  else
-    warn "这台机器上没有 systemctl：规则这次生效了，但**重启后会丢**。"
-  fi
+  systemctl daemon-reload || die "无法加载宿主网络单元，停止安装。"
+  systemctl enable --now dsh-cloud-harden.service || die "无法启用宿主网络单元，停止安装。查：systemctl status dsh-cloud-harden"
 
-  warn "代价：这台机器上**所有**容器（不只是本平台的）都再也够不到宿主的监听。要撤：iptables -D INPUT -j $HARDEN_CHAIN && systemctl disable --now dsh-cloud-harden（或跑 install.sh uninstall）。"
+  warn "平台实例将不能访问宿主/私网服务或主动使用 IPv6；dshw 是平台保留网桥前缀，其他业务不可使用。卸载平台时才移除网络边界。"
   warn "firewalld / ufw 一 reload 有可能把这条链冲掉 —— 复查：iptables -L $HARDEN_CHAIN -n"
 }
 
 # 撤掉加固。**只在 uninstall 调**，而且不限于 --purge：这套规则会误伤这台机器上别的容器，
 # 平台都不在了就不该留着。
 harden_host_down() {
-  local had=0
+  local had=0 firewall
   if [ -f "$HARDEN_UNIT" ]; then had=1; fi
-  if have iptables; then
-    if iptables -L "$HARDEN_CHAIN" -n >/dev/null 2>&1; then had=1; fi
-  fi
+  for firewall in iptables ip6tables; do
+    if have "$firewall" && "$firewall" -L "$HARDEN_CHAIN" -n >/dev/null 2>&1; then had=1; fi
+  done
   if [ "$had" = 0 ]; then return 0; fi
 
   if have systemctl; then
     systemctl disable --now dsh-cloud-harden.service >/dev/null 2>&1 || true
   fi
-  if have iptables; then
-    iptables -D INPUT -j "$HARDEN_CHAIN" 2>/dev/null || true
-    iptables -F "$HARDEN_CHAIN" 2>/dev/null || true
-    iptables -X "$HARDEN_CHAIN" 2>/dev/null || true
-  fi
+  for firewall in iptables ip6tables; do
+    if have "$firewall"; then
+      "$firewall" -D INPUT -j "$HARDEN_CHAIN" 2>/dev/null || true
+      "$firewall" -F "$HARDEN_CHAIN" 2>/dev/null || true
+      "$firewall" -X "$HARDEN_CHAIN" 2>/dev/null || true
+      "$firewall" -D FORWARD -j dsh-cloud-forward 2>/dev/null || true
+      "$firewall" -F dsh-cloud-forward 2>/dev/null || true
+      "$firewall" -X dsh-cloud-forward 2>/dev/null || true
+      "$firewall" -F dsh-cloud-egress 2>/dev/null || true
+      "$firewall" -X dsh-cloud-egress 2>/dev/null || true
+    fi
+  done
   rm -f "$HARDEN_UNIT"
   if have systemctl; then
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -571,10 +640,11 @@ start_services() {
 
   STEP='跑数据库迁移'
   log "迁移"
-  compose run --rm control-plane migrate
+  # Postgres is already ready; migrations must not start the privileged runtime dependency.
+  compose run --rm --no-deps control-plane migrate
 
-  STEP='起控制面与入口'
-  compose up -d control-plane traefik
+  STEP='起节点、控制面与入口'
+  compose up -d node-agent control-plane traefik
 
   STEP='等控制面就绪'
   wait_for_console
@@ -596,7 +666,7 @@ start_services() {
   fi
   printf '\n'
   printf '  下一步：登录 → 管理台「镜像管理」把实例镜像设为默认 → 建实例。\n'
-  printf '  安全边界（为什么控制面持有 docker.sock + CAP_SYS_ADMIN 是预期内的）：\n'
+  printf '  安全边界（宿主权限由节点服务持有，控制面只连接受限接口）：\n'
   printf '    https://github.com/eskim2001/dshcloud/blob/main/docs/ARCHITECTURE.md\n'
 }
 
@@ -646,9 +716,8 @@ cmd_install() {
   provision_pool
   fetch_assets
   # 放在 fetch_assets 之后：它把 $STATE_DIR 建出来，而加固脚本落在那里。
-  # 重跑**不会**因为这次没带 --harden-host 就把上次的规则撤掉 —— 那是操作者显式开过的开关，
-  # 一次普通 upgrade 把它悄悄关掉是最坏的行为（撤法见 harden_host 打印的那行）。
-  if [ "$HARDEN_HOST" = 1 ]; then harden_host; fi
+  # 首装和升级都必须成功配置边界后才能启动服务。
+  harden_host
   write_env
   render_configs
   start_services

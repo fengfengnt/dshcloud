@@ -10,7 +10,16 @@ export type Db = ReturnType<typeof createDb>['db']
  * 注意：实例容器**永远**拿不到这个连接（宿主回环发布 + 零跨实例凭据）。
  */
 export function createDb(url: string) {
-  const client = postgres(url, { max: 10, onnotice: () => {} })
+  const client = postgres(url, {
+    max: 10,
+    connect_timeout: 5,
+    connection: {
+      statement_timeout: 15_000,
+      lock_timeout: 5_000,
+      idle_in_transaction_session_timeout: 30_000,
+    },
+    onnotice: () => {},
+  })
   const db = drizzle(client, { schema })
   return { db, client }
 }

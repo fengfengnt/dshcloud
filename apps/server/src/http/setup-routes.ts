@@ -4,6 +4,7 @@ import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { AccountExistsError } from '../account.js'
 import { CONSOLE_LABEL } from '../env.js'
+import { DomainSchema } from '../domain.js'
 
 /**
  * 引导态的 setup 端点。
@@ -39,12 +40,13 @@ export interface SetupDeps {
 }
 
 /** 父域形状：小写 hostname，且**至少两个标签**（否则 `console.<父域>` 不成立）。 */
-const BaseDomainSchema = z
-  .string()
-  .min(3)
-  .max(253)
-  .regex(/^[a-z0-9.-]+$/)
-  .refine((d) => d.includes('.'), { message: '父域至少要两个标签，如 example.com' })
+const BaseDomainSchema = DomainSchema
+const SetupDomainsSchema = z.object({
+  baseDomain: BaseDomainSchema,
+  consoleDomain: BaseDomainSchema.optional(),
+}).refine(value => value.consoleDomain !== value.baseDomain, {
+  path: ['consoleDomain'], message: '控制台不能使用工作空间父域本身',
+})
 
 /**
  * 请求体。口径跟平台别处一致（`admin-routes` 的邀请、`invitation-routes` 的设密码），
@@ -52,8 +54,11 @@ const BaseDomainSchema = z
  */
 const SetupBodySchema = z.object({
   baseDomain: BaseDomainSchema,
+  consoleDomain: BaseDomainSchema.optional(),
   email: z.string().trim().email().max(254),
   password: z.string().min(8).max(200),
+}).refine(value => value.consoleDomain !== value.baseDomain, {
+  path: ['consoleDomain'], message: '控制台不能使用工作空间父域本身',
 })
 
 /** 常量时间比较（等长时）。`expected` 为空一律不匹配 —— 别让「没配 token」变成「谁都能配」。 */
@@ -104,20 +109,20 @@ export function registerSetupRoutes(app: FastifyInstance, deps: SetupDeps): void
     if (!tokenMatches(deps.token, typeof given === 'string' ? given : '')) {
       return reply.code(401).send({ error: 'invalid-token' })
     }
-    const query = request.query as { baseDomain?: unknown }
-    const parsed = BaseDomainSchema.safeParse(query.baseDomain)
+    const parsed = SetupDomainsSchema.safeParse(request.query)
     if (!parsed.success) {
       return reply.code(400).send({ error: 'invalid-domain' })
     }
 
     const resolve = deps.resolveSubdomain ?? defaultResolve
-    const probe = `dsh-check-${randomBytes(4).toString('hex')}.${parsed.data}`
-    const addresses = await resolve(probe)
-    // 控制台主机名由**服务端**算并回给界面 —— 那个字面量（`console`）已经有三处副本，
-    // 别让 UI 变成第四处
+    const probe = `dsh-check-${randomBytes(4).toString('hex')}.${parsed.data.baseDomain}`
+    const consoleDomain = parsed.data.consoleDomain ?? `${CONSOLE_LABEL}.${parsed.data.baseDomain}`
+    const [addresses, consoleAddresses] = await Promise.all([resolve(probe), resolve(consoleDomain)])
     return {
-      resolved: addresses.length > 0,
-      consoleDomain: `${CONSOLE_LABEL}.${parsed.data}`,
+      resolved: addresses.length > 0 && consoleAddresses.length > 0,
+      workspaceResolved: addresses.length > 0,
+      consoleResolved: consoleAddresses.length > 0,
+      consoleDomain,
     }
   })
 
@@ -142,12 +147,12 @@ export function registerSetupRoutes(app: FastifyInstance, deps: SetupDeps): void
     if (!parsed.success) {
       const issue = parsed.error.issues[0]
       // 域名和账号分开报：UI 的文案不同（"父域写错了" vs "邮箱/密码不合格"）
-      const code = issue?.path[0] === 'baseDomain' ? 'invalid-domain' : 'invalid-account'
+      const code = ['baseDomain', 'consoleDomain'].includes(String(issue?.path[0])) ? 'invalid-domain' : 'invalid-account'
       return reply.code(400).send({ error: code, detail: issue?.message ?? '请求体不合法' })
     }
 
     const { baseDomain, email, password } = parsed.data
-    const consoleDomain = `${CONSOLE_LABEL}.${baseDomain}`
+    const consoleDomain = parsed.data.consoleDomain ?? `${CONSOLE_LABEL}.${baseDomain}`
 
     // **先建号再落域名**：建号失败（邮箱已被占）时域名还没写进库，向导还能重来一次。
     // 反过来就会留下"域名配好了、但没有任何账号"的死局 —— 那个状态连界面都进不去。
@@ -166,7 +171,7 @@ export function registerSetupRoutes(app: FastifyInstance, deps: SetupDeps): void
     // 回**结构化结果**而不是一句中文：控制台是双语的，文案归 UI 组。
     const resolve = deps.resolveSubdomain ?? defaultResolve
     const probe = `dsh-check-${randomBytes(4).toString('hex')}.${baseDomain}`
-    const addresses = await resolve(probe)
+    const [addresses, consoleAddresses] = await Promise.all([resolve(probe), resolve(consoleDomain)])
 
     await saveDomains({ baseDomain, consoleDomain })
 
@@ -178,6 +183,11 @@ export function registerSetupRoutes(app: FastifyInstance, deps: SetupDeps): void
         restart()
       })
     }
-    return { consoleDomain, email, dns: { probe, resolved: addresses.length > 0 } }
+    return { consoleDomain, email, dns: {
+      probe,
+      resolved: addresses.length > 0 && consoleAddresses.length > 0,
+      workspaceResolved: addresses.length > 0,
+      consoleResolved: consoleAddresses.length > 0,
+    } }
   })
 }

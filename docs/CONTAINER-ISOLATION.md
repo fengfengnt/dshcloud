@@ -311,13 +311,15 @@ dsh 的 agent 会 spawn 进程、跑 shell、写文件——**这是它的本职
 
 | 层 | 已生效 | 可选 | 未做 | 挡不住 |
 |---|---|---|---|---|
-| **安全隔离** | 每实例一网络；回环发布；独立存储 + Linux 硬配额；零跨实例凭据；MaskedPaths（默认 + DMI）；禁 `--privileged` | 宿主 INPUT 规则（挡容器到宿主非回环服务）；lxcfs 三文件 | CapDrop；no-new-privileges；seccomp 收紧；ReadonlyPaths 显式设置；userns-remap | 共享内核（逃逸即宿主失陷）；egress 过滤；`sysinfo(2)` 直读 |
+| **安全隔离** | 每实例一网络；回环发布；独立存储 + Linux 硬配额；零跨实例凭据；MaskedPaths（默认 + DMI）；`no-new-privileges`；工作负载非 root（固定 `1000:1000`，属主由平台侧在建容器前迁）；禁 `--privileged` | 宿主 INPUT 规则（挡容器到宿主非回环服务）；lxcfs 三文件 | CapDrop；ReadonlyPaths 显式设置；userns-remap | 共享内核（逃逸即宿主失陷）；egress 过滤；`sysinfo(2)` 直读 |
 | **资源隔离** | pids / mem / cpu 上限；磁盘字节 + inode 硬配额（Linux） | — | blkio / 网络带宽限制 | 开发机无磁盘硬配额 |
 | **信息泄漏** | DMI 遮罩 | lxcfs（meminfo / uptime / swaps） | — | `loadavg` / `cpuinfo` / `btime` / `diskstats` / `slabinfo`；`sysinfo(2)` 直读 |
 
 （逐项现状与出处以 [ARCHITECTURE](ARCHITECTURE.md) §四/§五、
 [SECURITY-HARDENING](SECURITY-HARDENING.md)、[RUNTIME-CONTAINER-EVAL](RUNTIME-CONTAINER-EVAL.md)
-为准。）
+为准。文献与行业结论另见 [ISOLATION-LITERATURE](ISOLATION-LITERATURE.md)。）
+
+**seccomp 收紧不在「未做」列里 —— 是决定不做**：① 它是**不可信代码的纵深**（此表列的是边界与加固事实）；② Docker 的 `seccomp=<profile>` 是整份替换、没有"默认 + 额外 deny"的写法，收紧等于在仓库里维护一份会随引擎版本漂移的分叉。默认 profile 继续生效，取舍与顺序见 [ISOLATION-PLAN](ISOLATION-PLAN.md)。
 
 ---
 

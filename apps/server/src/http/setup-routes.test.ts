@@ -11,6 +11,18 @@ import { registerSetupRoutes, type SetupDeps } from './setup-routes.js'
  * "域名配好了但没有任何账号"的死局，那个状态连界面都进不去）。
  */
 describe('setup 端点', () => {
+  it('保存显式独立控制台域名', async () => {
+    app = await build()
+    const response = await post(body({ consoleDomain: 'console.other.net' }))
+    expect(response.statusCode).toBe(200)
+    expect(saved).toEqual([{ baseDomain: 'example.com', consoleDomain: 'console.other.net' }])
+  })
+  it.each(['example.com', 'evil.test/path', 'https://console.other.net', ''])('拒绝非法控制台域名 %j，且不建管理员', async consoleDomain => {
+    app = await build()
+    expect((await post(body({ consoleDomain }))).statusCode).toBe(400)
+    expect(created).toHaveLength(0)
+    expect(saved).toHaveLength(0)
+  })
   let app: FastifyInstance
   const saved: Array<{ baseDomain: string; consoleDomain: string }> = []
   const created: Array<{ email: string; password: string }> = []
@@ -172,7 +184,7 @@ describe('setup 端点', () => {
     expect(res.json().consoleDomain).toBe('console.example.com')
     expect(res.json().email).toBe('admin@example.com')
     // 回结构化结果（不是一句中文）：文案归双语的 UI 组
-    expect(res.json().dns).toEqual({ probe: expect.stringContaining('.example.com'), resolved: true })
+    expect(res.json().dns).toEqual({ probe: expect.stringContaining('.example.com'), resolved: true, workspaceResolved: true, consoleResolved: true })
     expect(created).toEqual([{ email: 'admin@example.com', password: 'correct-horse' }])
     expect(saved).toEqual([{ baseDomain: 'example.com', consoleDomain: 'console.example.com' }])
 
@@ -238,7 +250,34 @@ describe('setup 端点', () => {
       app = await build()
       const res = await probe('baseDomain=example.com')
       expect(res.statusCode).toBe(200)
-      expect(res.json()).toEqual({ resolved: true, consoleDomain: 'console.example.com' })
+      expect(res.json()).toEqual({ resolved: true, consoleDomain: 'console.example.com', workspaceResolved: true, consoleResolved: true })
+    })
+
+    it('独立控制台未解析时，泛解析成功不能使检查通过', async () => {
+      const queried: string[] = []
+      app = await build({ resolveSubdomain: async hostname => {
+        queried.push(hostname)
+        return hostname === 'console.other.net' ? [] : ['203.0.113.7']
+      } })
+      const result = await probe('baseDomain=example.com&consoleDomain=console.other.net')
+      expect(result.json()).toEqual({ resolved: false, workspaceResolved: true, consoleResolved: false, consoleDomain: 'console.other.net' })
+      expect(queried).toContain('console.other.net')
+      expect(queried.some(hostname => /^dsh-check-.*\.example\.com$/u.test(hostname))).toBe(true)
+    })
+
+    it('控制台可解析但泛解析失败时仍未通过', async () => {
+      app = await build({ resolveSubdomain: async hostname => hostname === 'console.other.net' ? ['203.0.113.7'] : [] })
+      const result = await probe('baseDomain=example.com&consoleDomain=console.other.net')
+      expect(result.json()).toMatchObject({ resolved: false, workspaceResolved: false, consoleResolved: true })
+    })
+
+    it('非法或相同控制台域名在 DNS 查询前拒绝', async () => {
+      let queries = 0
+      app = await build({ resolveSubdomain: async () => { queries++; return [] } })
+      for (const consoleDomain of ['example.com', 'bad/path']) {
+        expect((await probe(`baseDomain=example.com&consoleDomain=${encodeURIComponent(consoleDomain)}`)).statusCode).toBe(400)
+      }
+      expect(queries).toBe(0)
     })
 
     it('解析不到 → resolved: false（界面据此挡住提交）', async () => {

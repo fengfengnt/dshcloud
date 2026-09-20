@@ -1,4 +1,10 @@
-import { BRIDGE_PORT, DATA_ROOT, GATE_TOKEN_HEADER } from '../constants.js'
+import {
+  BRIDGE_PORT,
+  DATA_ROOT,
+  GATE_TOKEN_HEADER,
+  INSTANCE_GID,
+  INSTANCE_UID,
+} from '../constants.js'
 import type { InstanceSpec } from '../schema.js'
 import type {
   InstanceRenderer,
@@ -63,12 +69,18 @@ function renderEnv(spec: InstanceSpec, ctx: RenderContext): string[] {
  * 关键设计（见 docs/ARCHITECTURE.md §四）：
  * - **`/data` 必须活得过升级**：升级走「删掉重建」，容器一定重造，只有平台侧的数据卷
  *   才活得过去。这份约束换运行时也不变。
- * - **不能用宿主目录直挂**：直挂走 Docker Desktop 的 VM 共享文件系统，那个后端有硬链接
- *   语义问题（上游 #1559）——unlink 掉两个名字中的一个，剩下的那个会永久只读，而 dsh 的
- *   会话日志每次落盘都会踩到。命名卷是 VM 里的真文件系统，没有这个问题。
+ * - **不能用宿主目录直挂**（开发机那一档）：直挂走 Docker Desktop 的 VM 共享文件系统，
+ *   那个后端有硬链接语义问题（上游 #1559）——unlink 掉两个名字中的一个，剩下的那个会永久只读，
+ *   而 dsh 的会话日志每次落盘都会踩到。命名卷是 VM 里的真文件系统，没有这个问题。
+ *   Linux 宿主上走的是另一档：宿主池目录 bind 进 `/data`（见 [ARCHITECTURE §四]），
+ *   上面那条理由对它不适用 —— 它依赖的就是那个宿主目录（XFS project quota 挂在那儿）。
  * - **容量 = `quota.diskMb`**，只是**声明值**（记进卷的 label）；Docker 命名卷没有硬配额，
  *   真正的上限要宿主侧文件系统配额，而且都**不能原地扩容**。
- * - **运行用户 = root**（`'0'`）：卷的根目录归 root，声明式属主映射对命名卷无效。
+ * - **运行用户 = 固定的 `INSTANCE_UID`**：数据卷的根目录是 root 建的，而 `.owner()` 这类
+ *   声明式属主映射对命名卷无效，所以属主由**平台侧在起容器前**递归改好
+ *   （`RuntimeDriver.chownStorage`，见 `provisioner.applyRuntime`）。容器内降权做不到 ——
+ *   `CapDrop: ALL` 下 `setpriv` / `su` / `gosu` 全是 `EPERM`（见 D29），只能在建容器时由
+ *   运行时施加这一条。
  * - **WORKDIR = 挂载点本身**（`/data`）：空卷里还没有 `/data/home/workspace` 那层骨架，
  *   而 `/data` 作为挂载点在容器起来时一定存在 —— 那层骨架归镜像的 entrypoint 建，建完再 cd 进去。
  */
@@ -89,7 +101,7 @@ export function renderInstance(spec: InstanceSpec, ctx: RenderContext): Rendered
     machineName: machineName(slug),
     hostname: instanceHostname(slug, ctx.baseDomain),
     image: ctx.baseImage,
-    user: '0',
+    user: `${INSTANCE_UID}:${INSTANCE_GID}`,
     workingDir: DATA_ROOT,
     env: renderEnv(spec, ctx),
     guestPort: BRIDGE_PORT,

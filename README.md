@@ -1,3 +1,5 @@
+> **Usage restriction:** For testing on a fresh Linux installation and local development only. Do not use in production or install on a host running existing services.
+
 <p align="center">
   <picture>
     <source media="(prefers-reduced-motion: reduce) and (prefers-color-scheme: dark)" srcset="apps/web/public/brand/dshcloud-lockup-dark.svg">
@@ -32,7 +34,11 @@
 
 After deploying the platform, administrators can add users through invitation links. Each user can create and manage multiple workspaces within their assigned quota.
 
-> **Early development.** Use this project for evaluation and development. It is not production-ready; deployment validation and security work remain open. See the permission boundaries and operational limits in the [architecture and security model](docs/ARCHITECTURE.md) before exposing it to the internet.
+> **Early development — run it on a test machine.** This is not production-ready: deployment validation and security work are still open. See the permission boundaries and operational limits in the [architecture and security model](docs/ARCHITECTURE.md) before exposing it to the internet.
+>
+> **The installer changes the host it runs on**, and the platform keeps changing it afterwards — it writes a storage pool and an `/etc/fstab` entry, installs deployment assets under `/opt/dsh-cloud`, binds ports `80` and `443`, and runs containers with access to the Docker socket. Workspace data lives on the host filesystem, and workspace containers run with permission to modify it. Use a machine you are willing to rebuild.
+>
+> Interfaces, configuration and on-disk layout are still moving. Watch the repository for releases and read them before upgrading.
 
 ## Local dsh vs. dshcloud
 
@@ -203,7 +209,14 @@ curl -fsSL "https://raw.githubusercontent.com/eskim2001/dshcloud/main/scripts/in
 
 </details>
 
-> The project is in early development: deployment verification and security work still have open items. Before exposing it to the internet, read the hardening checklist and permission boundaries in the [architecture and security model](docs/ARCHITECTURE.md).
+**What the installer changes on your host**
+
+- Creates the storage pool at `--pool-root` (default `/var/lib/dsh`). If that path is not already XFS mounted with `pquota`, it writes a loopback XFS image and adds a mount entry to `/etc/fstab`.
+- Writes deployment assets and secrets to `/opt/dsh-cloud`.
+- Starts the ingress, Postgres and the control plane as containers, binding ports `80` and `443` on the host.
+- Every install/update configures platform-scoped INPUT/FORWARD rules and a systemd boot unit. Failure stops installation. Workspace access to host services, private networks and Docker bridges is blocked; outbound IPv6 is denied. Private model/Git endpoints will be affected. `--harden-host` remains a compatibility alias. Boot ordering and firewall reload protection still await completion and Linux verification; see [release gates](docs/PRODUCTION-READINESS.md).
+
+The node agent holds the Docker socket and `CAP_SYS_ADMIN`, equivalent to host root. The control plane calls it through a local socket and retains broad instance-management authority. See [Deployment](docker/platform/README.md).
 
 ### Local development
 

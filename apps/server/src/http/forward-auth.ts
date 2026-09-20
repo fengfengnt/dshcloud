@@ -21,7 +21,7 @@ export interface ForwardAuthDeps {
   gateSecret: string
   findInstanceBySlug(slug: string): Promise<InstanceLookup | undefined>
   /** 从 Cookie 解析出用户；无有效会话返回 undefined。 */
-  resolveUserId(cookie: string | undefined): Promise<string | undefined>
+  resolveUserId(cookie: string | undefined, slug?: string): Promise<string | undefined>
 }
 
 export interface ForwardAuthInput {
@@ -30,6 +30,8 @@ export interface ForwardAuthInput {
   cookie: string | undefined
   /** 原始请求的完整 URL，用于登录后跳回。 */
   originalUrl: string
+  method?: string
+  origin?: string
 }
 
 export type ForwardAuthResult =
@@ -45,11 +47,17 @@ export function instanceSlugFromHost(
   host: string | undefined,
   baseDomain: string,
 ): string | undefined {
-  if (host === undefined) return undefined
-  const hostname = host.split(':')[0]?.toLowerCase()
-  if (hostname === undefined) return undefined
+  if (host === undefined || !/^[a-z0-9.-]+(?::[0-9]{1,5})?$/i.test(host)) return undefined
+  let hostname: string
+  try {
+    const authority = new URL(`http://${host}`)
+    if (authority.port === '0') return undefined
+    hostname = authority.hostname
+  } catch {
+    return undefined
+  }
 
-  const suffix = `.${baseDomain}`
+  const suffix = `.${baseDomain.toLowerCase()}`
   if (!hostname.endsWith(suffix)) return undefined
 
   const slug = hostname.slice(0, -suffix.length)
@@ -73,10 +81,17 @@ export async function decideForwardAuth(
   const slug = instanceSlugFromHost(input.host, deps.baseDomain)
   if (slug === undefined) return { status: 404 }
 
+  // Sibling subdomains are same-site, so SameSite cookies do not stop their CSRF.
+  const expectedOrigin = `${deps.publicScheme}://${input.host?.toLowerCase()}`
+  if (input.origin !== undefined && input.origin !== expectedOrigin) return { status: 403 }
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(input.method ?? 'GET') && input.origin === undefined) {
+    return { status: 403 }
+  }
+
   const instance = await deps.findInstanceBySlug(slug)
   if (instance === undefined) return { status: 404 }
 
-  const userId = await deps.resolveUserId(input.cookie)
+  const userId = await deps.resolveUserId(input.cookie, slug)
   if (userId === undefined) {
     const next = encodeURIComponent(input.originalUrl)
     return {

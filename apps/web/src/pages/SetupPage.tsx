@@ -31,6 +31,7 @@ export default function SetupPage() {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [typedDomain, setTypedDomain] = useState('')
+  const [typedConsoleDomain, setTypedConsoleDomain] = useState('')
   const [override, setOverride] = useState(false)
   const { t } = useTranslation()
 
@@ -45,11 +46,14 @@ export default function SetupPage() {
     .replace(/^https?:\/\//u, '')
     .replace(/[/?#].*/u, '')
     .replace(/\.$/u, '')
+  const consoleDomain = typedConsoleDomain.trim().toLowerCase() || `console.${domain}`
   const shapeOk = /^[a-z0-9.-]+$/u.test(domain) && domain.includes('.')
+    && /^[a-z0-9.-]+$/u.test(consoleDomain) && consoleDomain.includes('.') && consoleDomain !== domain
 
-  const probe = useDomainProbe(token, domain, shapeOk)
+  const probe = useDomainProbe(token, domain, consoleDomain, shapeOk)
+  useEffect(() => { setOverride(false) }, [domain, consoleDomain])
   const mutation = useMutation({
-    mutationFn: () => submitSetup({ token, baseDomain: domain, email, password }),
+    mutationFn: () => submitSetup({ token, baseDomain: domain, consoleDomain, email, password }),
   })
 
   const submit = (e: FormEvent) => {
@@ -78,8 +82,7 @@ export default function SetupPage() {
   }
 
   const error = mutation.error
-  const code = error instanceof ApiError ? error.message : ''
-  const blocked = probe === 'missing' && !override
+  const blocked = probe !== 'ok' && !override
 
   return (
     <Shell>
@@ -131,7 +134,6 @@ export default function SetupPage() {
               aria-invalid={probe === 'missing'}
               className="login-input"
             />
-            <DomainStatus probe={probe} domain={domain} host={host} isIp={isIp} />
             {isIp && domain !== host && (
               <Button
                 type="button"
@@ -144,15 +146,29 @@ export default function SetupPage() {
               </Button>
             )}
           </Field>
+          <Field className="flex flex-col gap-1.5 text-left">
+            <FieldLabel htmlFor="consoleDomain" className="login-label">{t('setup.consoleDomain')}</FieldLabel>
+            <Input
+              id="consoleDomain"
+              value={typedConsoleDomain}
+              onChange={(e) => setTypedConsoleDomain(e.target.value)}
+              placeholder={domain ? `console.${domain}` : 'console.example.com'}
+              autoComplete="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              className="login-input"
+            />
+            <DomainStatus probe={probe} domain={domain} consoleDomain={consoleDomain} host={host} isIp={isIp} />
+          </Field>
         </FieldGroup>
 
-        {error !== undefined && (
+        {mutation.isError && (
           <Alert variant="destructive" className="py-2.5 text-xs">
             <AlertDescription>{errorText(error, t)}</AlertDescription>
           </Alert>
         )}
 
-        {blocked && (
+        {blocked && (probe === 'missing' || probe === 'error') && (
           <Button
             type="button"
             variant="link"
@@ -174,35 +190,36 @@ export default function SetupPage() {
   )
 }
 
-type Probe = 'idle' | 'checking' | 'ok' | 'missing'
+type Probe = 'idle' | 'checking' | 'ok' | 'missing' | 'error'
 
 /** 边打字边查泛解析。停手 450ms 再发，别把人家的 DNS 打爆。 */
-function useDomainProbe(token: string, domain: string, shapeOk: boolean): Probe {
-  const [state, setState] = useState<Probe>('idle')
+function useDomainProbe(token: string, domain: string, consoleDomain: string, shapeOk: boolean): Probe {
+  const key = JSON.stringify([token, domain, consoleDomain])
+  const [result, setResult] = useState<{ key: string; state: Probe }>({ key: '', state: 'idle' })
 
   useEffect(() => {
     if (token === '' || !shapeOk) {
-      setState('idle')
       return
     }
-    setState('checking')
+    setResult({ key, state: 'checking' })
     let alive = true
     const timer = setTimeout(() => {
-      probeSetupDomain(token, domain)
+      probeSetupDomain(token, domain, consoleDomain)
         .then((r) => {
-          if (alive) setState(r.resolved ? 'ok' : 'missing')
+          if (alive) setResult({ key, state: r.resolved ? 'ok' : 'missing' })
         })
         .catch(() => {
-          if (alive) setState('idle')
+          if (alive) setResult({ key, state: 'error' })
         })
     }, 450)
     return () => {
       alive = false
       clearTimeout(timer)
     }
-  }, [token, domain, shapeOk])
+  }, [token, domain, consoleDomain, shapeOk, key])
 
-  return state
+  if (token === '' || !shapeOk) return 'idle'
+  return result.key === key ? result.state : 'checking'
 }
 
 /**
@@ -212,6 +229,7 @@ function useDomainProbe(token: string, domain: string, shapeOk: boolean): Probe 
 function DomainStatus(props: {
   probe: Probe
   domain: string
+  consoleDomain: string
   host: string
   isIp: boolean
 }): ReactNode {
@@ -223,14 +241,15 @@ function DomainStatus(props: {
   }
 
   if (props.probe === 'ok') {
-    return <FieldDescription>{t('setup.dnsOk', { domain: `console.${props.domain}` })}</FieldDescription>
+    return <FieldDescription>{t('setup.dnsOk', { domain: props.consoleDomain })}</FieldDescription>
   }
+  if (props.probe === 'error') return <FieldDescription>{t('setup.dnsError')}</FieldDescription>
 
   return (
     <div className="flex flex-col gap-2">
       <FieldDescription>{t('setup.dnsMissing')}</FieldDescription>
       <div className="rounded-md border bg-muted/40 px-2 py-1.5 font-mono text-[11px] leading-5">
-        <div>{`console.${props.domain}`}</div>
+        <div>{props.consoleDomain}</div>
         <div>{`*.${props.domain}`}</div>
       </div>
       {props.isIp && (

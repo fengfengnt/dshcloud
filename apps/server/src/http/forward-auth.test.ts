@@ -33,6 +33,15 @@ function input(host: string | undefined, cookie?: string): ForwardAuthInput {
 }
 
 describe('instanceSlugFromHost', () => {
+  it.each([
+    'alice.app.example.com:bad', 'alice.app.example.com:65536',
+    'alice.app.example.com:0', 'alice.app.example.com:',
+    'alice.app.example.com:443:evil', 'alice.app.example.com/path',
+    'alice.app.example.com@evil.test', ' alice.app.example.com',
+    'alice.app.example.com\\evil', 'alice.app.example.com\t',
+  ])('拒绝畸形 Host %j', host => {
+    expect(instanceSlugFromHost(host, BASE)).toBeUndefined()
+  })
   it('取出单标签子域', () => {
     expect(instanceSlugFromHost('alice.app.example.com', BASE)).toBe('alice')
   })
@@ -70,6 +79,27 @@ describe('instanceSlugFromHost', () => {
 
   it('拒绝非法 slug 字符', () => {
     expect(instanceSlugFromHost('alice_1.app.example.com', BASE)).toBeUndefined()
+  })
+})
+
+describe('workspace origin boundary', () => {
+  const owner = input(`alice.${BASE}`, 'sid=alice')
+  it.each([`https://bob.${BASE}`, `https://${CONSOLE}`, 'https://evil.example', 'null'])(
+    'rejects browser requests from %s even with an owner cookie', async (origin) => {
+      for (const method of ['GET', 'POST', 'DELETE']) {
+        expect(await decideForwardAuth({ ...owner, origin, method }, deps()))
+          .toEqual({ status: 403 })
+      }
+    },
+  )
+  it('allows same-origin writes and ordinary navigation', async () => {
+    expect((await decideForwardAuth(owner, deps())).status).toBe(200)
+    expect((await decideForwardAuth({
+      ...owner, method: 'POST', origin: `https://alice.${BASE}`,
+    }, deps())).status).toBe(200)
+  })
+  it.each(['POST', 'PUT', 'PATCH', 'DELETE'])('rejects %s without Origin', async (method) => {
+    expect(await decideForwardAuth({ ...owner, method }, deps())).toEqual({ status: 403 })
   })
 })
 

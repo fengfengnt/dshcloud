@@ -79,9 +79,11 @@ interface Fakes {
   calls: {
     createData: ReturnType<typeof vi.fn>
     ensure: ReturnType<typeof vi.fn>
+    chown: ReturnType<typeof vi.fn>
     usage: ReturnType<typeof vi.fn>
     snapshot: ReturnType<typeof vi.fn>
     restoreSnapshot: ReturnType<typeof vi.fn>
+    finishRestore: ReturnType<typeof vi.fn>
     destroy: ReturnType<typeof vi.fn>
     stopInstance: ReturnType<typeof vi.fn>
     removeInstance: ReturnType<typeof vi.fn>
@@ -98,9 +100,11 @@ interface Fakes {
 function build(): Fakes {
   const createData = vi.fn(async () => undefined)
   const ensure = vi.fn(async () => undefined)
+  const chown = vi.fn(async () => undefined)
   const usage = vi.fn(async () => ({ usedMb: 100 }))
   const snapshot = vi.fn(async () => undefined)
   const restoreSnapshot = vi.fn(async () => undefined)
+  const finishRestore = vi.fn(async () => undefined)
   const destroy = vi.fn(async () => undefined)
   const snapshotUsage = vi.fn(async () => undefined)
 
@@ -137,10 +141,12 @@ function build(): Fakes {
   const dataStore = {
     create: createData,
     ensure,
+    chown,
     usage,
     dir: (key: string) => `/var/lib/dsh/${key}`,
     snapshot,
     restoreSnapshot,
+    finishRestore,
     snapshotUsage,
     destroy,
     ownerId: '502',
@@ -166,9 +172,11 @@ function build(): Fakes {
     calls: {
       createData,
       ensure,
+      chown,
       usage,
       snapshot,
       restoreSnapshot,
+      finishRestore,
       destroy,
       stopInstance,
       removeInstance,
@@ -218,6 +226,32 @@ describe('storage ownership across lifecycle operations', () => {
     expect(createInstanceRecord).toHaveBeenCalledWith({}, expect.objectContaining({ ownerId: 'u1' }), 3)
     expect(fakes.dataStore.create).toHaveBeenCalledWith('unique-data-key', quota.diskMb)
     expect(fakes.calls.createInstance).toHaveBeenCalledWith(expect.objectContaining({ slug: 'alice' }), expect.objectContaining({ storageKey: 'unique-data-key' }))
+  })
+
+  it('重建都先迁属主，且**早于建容器**', async () => {
+    // 属主不对不会当场报错：实例起得来、入口也应答，agent 跑到一半才写不了盘
+    // —— 所以既盯"调没调"，也盯"在不在建容器之前"。
+    findById.mockResolvedValue(
+      row({ storageKey: 'unique-data-key', containerId: null, status: 'stopped' }),
+    )
+    const fakes = build()
+    await makeProvisioner(fakes).start('i-1')
+
+    expect(fakes.calls.chown).toHaveBeenCalledWith('unique-data-key')
+    const chownAt = fakes.calls.chown.mock.invocationCallOrder[0] ?? -1
+    const createAt = fakes.calls.createInstance.mock.invocationCallOrder[0] ?? -1
+    expect(fakes.calls.stopInstance).toHaveBeenCalledWith('dsh-instance-alice')
+    expect(fakes.calls.stopInstance.mock.invocationCallOrder[0]).toBeLessThan(chownAt)
+    expect(chownAt).toBeLessThan(createAt)
+  })
+
+  it('停机失败则不迁属主，也不建立替代容器', async () => {
+    findById.mockResolvedValue(row())
+    const fakes = build()
+    fakes.calls.stopInstance.mockRejectedValueOnce(new Error('stop failed'))
+    await expect(makeProvisioner(fakes).restart('i-1')).rejects.toThrow('stop failed')
+    expect(fakes.calls.chown).not.toHaveBeenCalled()
+    expect(fakes.calls.createInstance).not.toHaveBeenCalled()
   })
 
   it('删除 = 数据真删（含快照），只把行留成主机名占位', async () => {
@@ -510,6 +544,50 @@ describe('换镜像：准入', () => {
 })
 
 describe('换镜像：升级', () => {
+  it('invalidates the old rollback image before replacing a stopped instance snapshot', async () => {
+    const db = statefulDb(row({ status: 'stopped', previousImage: 'dsh-instance:0.0.9_1' }))
+    const fakes = build()
+    fakes.calls.snapshot.mockImplementationOnce(async () => {
+      expect(db.current().previousImage).toBeNull()
+      throw new Error('snapshot failed')
+    })
+    await expect(makeProvisioner(fakes).setImage('i-1', NEW_IMAGE)).rejects.toThrow('snapshot failed')
+    expect(db.current().image).toBe(DEFAULT_REF)
+    expect(db.current().previousImage).toBeNull()
+    expect(fakes.calls.createInstance).not.toHaveBeenCalled()
+  })
+
+  it('does not replace a snapshot if invalidating its old image binding fails', async () => {
+    statefulDb(row({ status: 'stopped', previousImage: 'dsh-instance:0.0.9_1' }))
+    const fakes = build()
+    update.mockRejectedValueOnce(new Error('database unavailable'))
+    await expect(makeProvisioner(fakes).setImage('i-1', NEW_IMAGE)).rejects.toThrow('database unavailable')
+    expect(fakes.calls.snapshot).not.toHaveBeenCalled()
+    expect(fakes.calls.createInstance).not.toHaveBeenCalled()
+  })
+  it('快照未完成时，另一个编排对象的停机请求等待整个升级结束', async () => {
+    statefulDb(row())
+    const fakes = build()
+    let release!: () => void
+    let entered!: () => void
+    const snapshotEntered = new Promise<void>(resolve => { entered = resolve })
+    fakes.calls.snapshot.mockImplementationOnce(async () => {
+      entered()
+      await new Promise<void>(resolve => { release = resolve })
+    })
+    const upgrading = makeProvisioner(fakes).setImage('i-1', NEW_IMAGE)
+    await snapshotEntered
+    const stopping = makeProvisioner(fakes).stop('i-1')
+    await Promise.resolve()
+    expect(fakes.calls.stopInstance).toHaveBeenCalledTimes(1)
+    expect(fakes.calls.createInstance).not.toHaveBeenCalled()
+    release()
+    await upgrading
+    const stopped = await stopping
+    expect(stopped.status).toBe('stopped')
+    const stops = fakes.calls.stopInstance.mock.invocationCallOrder
+    expect(stops.at(-1)).toBeGreaterThan(fakes.calls.createInstance.mock.invocationCallOrder[0]!)
+  })
   it('停容器 → 打快照 → 落库（新镜像 + previous_image）→ 重建', async () => {
     const db = statefulDb(row())
     const fakes = build()
@@ -536,7 +614,7 @@ describe('换镜像：升级', () => {
     fakes.calls.snapshot.mockRejectedValue(new Error('宿主空间不足'))
 
     await expect(makeProvisioner(fakes).setImage('i-1', NEW_IMAGE)).rejects.toThrow(
-      /打快照失败，实例未改动/,
+      /打快照失败，当前数据未改动/,
     )
     // 落库这条**只认 image 那次写**——失败路径上的 restart 仍会写 status/containerId
     expect(update).not.toHaveBeenCalledWith({}, 'i-1', expect.objectContaining({ image: NEW_IMAGE }))
@@ -597,10 +675,87 @@ describe('换镜像：回滚', () => {
       image: 'dsh-instance:0.1.0_1',
       previousImage: null,
       containerId: null,
+      status: 'stopped',
     })
     expect(fakes.calls.createInstance).toHaveBeenCalled()
     expect(updated.image).toBe('dsh-instance:0.1.0_1')
     expect(db.current().previousImage).toBeNull()
+    expect(fakes.calls.finishRestore).toHaveBeenCalledWith('alice')
+    expect(fakes.calls.finishRestore.mock.invocationCallOrder[0]).toBeGreaterThan(
+      fakes.calls.createInstance.mock.invocationCallOrder[0]!,
+    )
+  })
+
+  it('retains recovery data when the restored runtime fails to start', async () => {
+    statefulDb(row({ image: NEW_IMAGE, previousImage: 'dsh-instance:0.1.0_1' }))
+    const fakes = build()
+    fakes.calls.createInstance.mockRejectedValueOnce(new Error('restored runtime failed'))
+    await expect(makeProvisioner(fakes).rollbackImage('i-1')).rejects.toThrow('restored runtime failed')
+    expect(fakes.calls.restoreSnapshot).toHaveBeenCalled()
+    expect(fakes.calls.finishRestore).not.toHaveBeenCalled()
+  })
+
+  it('removes old mounts before restore and records a failed copy without restarting', async () => {
+    const db = statefulDb(row({ image: NEW_IMAGE, previousImage: 'dsh-instance:0.1.0_1' }))
+    const fakes = build()
+    fakes.calls.restoreSnapshot.mockRejectedValueOnce(new Error('copy failed'))
+    await expect(makeProvisioner(fakes).rollbackImage('i-1')).rejects.toThrow('copy failed')
+    expect(fakes.calls.removeInstance).toHaveBeenCalledWith('dsh-instance-alice')
+    expect(fakes.calls.removeInstance.mock.invocationCallOrder[0]).toBeGreaterThan(
+      fakes.calls.stopInstance.mock.invocationCallOrder[0]!,
+    )
+    expect(fakes.calls.restoreSnapshot.mock.invocationCallOrder[0]).toBeGreaterThan(
+      fakes.calls.removeInstance.mock.invocationCallOrder[0]!,
+    )
+    expect(db.current().status).toBe('error')
+    expect(db.current().image).toBe(NEW_IMAGE)
+    expect(fakes.calls.createInstance).not.toHaveBeenCalled()
+    expect(fakes.calls.finishRestore).not.toHaveBeenCalled()
+  })
+
+  it('does not touch data when the old container cannot be removed', async () => {
+    const db = statefulDb(row({ image: NEW_IMAGE, previousImage: 'dsh-instance:0.1.0_1' }))
+    const fakes = build()
+    fakes.calls.removeInstance.mockRejectedValueOnce(new Error('remove failed'))
+    await expect(makeProvisioner(fakes).rollbackImage('i-1')).rejects.toThrow('remove failed')
+    expect(fakes.calls.restoreSnapshot).not.toHaveBeenCalled()
+    expect(db.current().status).toBe('error')
+  })
+
+  it('retains recovery data if committing the restored image fails', async () => {
+    statefulDb(row({ image: NEW_IMAGE, previousImage: 'dsh-instance:0.1.0_1' }))
+    const fakes = build()
+    fakes.calls.restoreSnapshot.mockImplementationOnce(async () => {
+      update.mockRejectedValueOnce(new Error('database unavailable'))
+    })
+    await expect(makeProvisioner(fakes).rollbackImage('i-1')).rejects.toThrow('database unavailable')
+    expect(fakes.calls.restoreSnapshot).toHaveBeenCalled()
+    expect(fakes.calls.createInstance).not.toHaveBeenCalled()
+    expect(fakes.calls.finishRestore).not.toHaveBeenCalled()
+  })
+
+  it('withdraws access before touching rollback data and leaves a stopped instance stopped', async () => {
+    const db = statefulDb(row({ status: 'stopped', image: NEW_IMAGE, previousImage: DEFAULT_REF }))
+    const fakes = build()
+    fakes.calls.stopInstance.mockImplementationOnce(async () => {
+      expect(db.current().status).toBe('provisioning')
+      expect(fakes.calls.syncRoutes).toHaveBeenCalled()
+    })
+    const result = await makeProvisioner(fakes).rollbackImage('i-1')
+    expect(result.status).toBe('stopped')
+    expect(result.image).toBe(DEFAULT_REF)
+    expect(fakes.calls.createInstance).not.toHaveBeenCalled()
+    expect(fakes.calls.finishRestore).toHaveBeenCalledWith('alice')
+  })
+
+  it('does not stop or restore when withdrawing rollback routes fails', async () => {
+    const db = statefulDb(row({ status: 'stopped', image: NEW_IMAGE, previousImage: DEFAULT_REF }))
+    const fakes = build()
+    fakes.calls.syncRoutes.mockRejectedValueOnce(new Error('route update failed'))
+    await expect(makeProvisioner(fakes).rollbackImage('i-1')).rejects.toThrow('route update failed')
+    expect(fakes.calls.stopInstance).not.toHaveBeenCalled()
+    expect(fakes.calls.restoreSnapshot).not.toHaveBeenCalled()
+    expect(db.current().status).toBe('error')
   })
 })
 

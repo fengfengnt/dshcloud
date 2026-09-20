@@ -198,10 +198,11 @@ dsh 是一个**编码 agent**。它的日常操作包括：
 | 禁 `--privileged` | **必须** | 不使用 | ✅ 已实现 |
 | MaskedPaths | **必须** | Docker 默认 + DMI 遮罩 | ✅ 已实现 |
 | CapDrop | 推荐 | `--cap-drop=ALL` + 按需 `--cap-add` | ⚠️ 未做 |
-| `no-new-privileges` | 推荐 | `--security-opt=no-new-privileges:true` | ⚠️ 未做 |
-| seccomp 收紧 | 推荐 | 在默认 profile 基础上进一步收紧 | ⚠️ 未做 |
+| `no-new-privileges` | 推荐 | `HostConfig.SecurityOpt = ['no-new-privileges']` | ✅ 已实现（2026-09-17） |
+| seccomp 收紧 | 推荐 | 在默认 profile 基础上进一步收紧 | ➖ 决定不做（继续用默认 profile，见 [ISOLATION-PLAN](ISOLATION-PLAN.md)） |
 | ReadonlyPaths 显式设置 | 低 | 显式写死代替依赖 Docker 默认 | ⚠️ 未做 |
 | userns-remap | 低 | 容器 root → 宿主非特权 UID | ⚠️ 未做 |
+| 工作负载非 root + 存储属主迁移 | 推荐 | 固定 `1000:1000`；属主由**平台侧**在建容器前递归迁（容器内降不了权） | ✅ 已实现（2026-09-17） |
 
 ### 4.7 Web 层
 
@@ -219,7 +220,7 @@ dsh 是一个**编码 agent**。它的日常操作包括：
 
 | 代价 | 影响 | 缓解 |
 |---|---|---|
-| **共享内核 → 逃逸即宿主失陷** | 所有实例 + 宿主一起沦陷 | seccomp（默认 profile）、MaskedPaths、未来 CapDrop / no-new-privileges |
+| **共享内核 → 逃逸即宿主失陷** | 所有实例 + 宿主一起沦陷 | seccomp（默认 profile）、MaskedPaths、`no-new-privileges`、未来 CapDrop |
 | **`/proc` 信息泄漏** | 实例可指纹宿主、推断邻居负载 | lxcfs（可选，遮三个文件）；`sysinfo(2)` 绕得开 |
 | **无原生 egress 过滤** | 实例可以访问任意外部地址 | 宿主侧 iptables（可选） |
 
@@ -228,10 +229,7 @@ dsh 是一个**编码 agent**。它的日常操作包括：
 | 项 | 风险 | 计划 |
 |---|---|---|
 | CapDrop | 容器保留 ~14 条默认 capability | 需要逐条验证 dsh 的兼容性后收紧 |
-| `no-new-privileges` | 容器内 setuid 二进制可提权 | 同上 |
-| seccomp 收紧 | 默认 profile 允许 ~300 个 syscall | 需要 profile 定制 |
 | ReadonlyPaths 显式化 | 依赖 Docker 默认值，版本间可能漂移 | 照抄写死 + 测试守着 |
-| 容器内降权 | 工作负载跑 root | 需要解决卷权限问题 |
 | 出网过滤 | 实例可任意出网 | M2 |
 | 同注册域 cookie 投毒 | 实例响应可种覆盖父域的 cookie | OPEN-QUESTIONS #13 |
 

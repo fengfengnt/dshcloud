@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { InstancePatch } from '../db/instance-repo.js'
 import type { InstanceRow } from '../db/schema.js'
 import { reconcileInstances } from './reconciler.js'
+import { lifecycleOperations } from './operation-queue.js'
 
 function row(over: Partial<InstanceRow> & { slug: string }): InstanceRow {
   return {
@@ -47,6 +48,33 @@ function build(rows: InstanceRow[], containerStatus: string | null = 'running') 
 }
 
 describe('对账：DB 状态 ↔ Docker 事实', () => {
+  it('reads state only after an in-flight lifecycle operation has finished', async () => {
+    let release!: () => void
+    let entered!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const barrier = new Promise<void>(resolve => { release = resolve })
+    let current = row({ slug: 'alice', status: 'stopped' })
+    const operation = lifecycleOperations.run(async () => {
+      entered()
+      await barrier
+      current = { ...current, status: 'error' }
+    })
+    await started
+    const listInstances = vi.fn(async () => [current])
+    const inspectStatus = vi.fn(async () => 'running')
+    const update = vi.fn(async () => undefined)
+    const reconciliation = reconcileInstances({
+      listInstances, inspectStatus, update,
+      listInstanceNames: async () => [], warn: vi.fn(),
+    })
+    try {
+      await Promise.resolve()
+      expect(listInstances).not.toHaveBeenCalled()
+    } finally { release(); await operation }
+    expect(await reconciliation).toEqual({ changed: 0 })
+    expect(inspectStatus).not.toHaveBeenCalled()
+    expect(update).not.toHaveBeenCalled()
+  })
   it('容器已退出但 DB 还写 running → 改成 stopped', async () => {
     const { run, update } = build([row({ slug: 'alice' })], 'exited')
     const { changed } = await run()

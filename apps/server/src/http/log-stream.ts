@@ -4,6 +4,8 @@ import { z } from 'zod'
 
 /** 心跳间隔。Traefik 的默认空闲超时比这长，够用。 */
 const HEARTBEAT_MS = 15_000
+const MAX_LOG_BYTES = 4 * 1024 * 1024
+const MAX_QUEUED_BYTES = 1024 * 1024
 
 export const LogsQuerySchema = z.object({
   /** 先补多少行历史，之后跟着流。 */
@@ -40,7 +42,13 @@ export async function streamContainerLogs(
   try {
     raw = await openLogs(containerId, opts)
   } catch (err) {
+    if (req.raw.aborted || reply.raw.destroyed) return
     await reply.code(502).send({ error: `无法读取日志：${messageOf(err)}` })
+    return
+  }
+
+  if (req.raw.aborted || reply.raw.destroyed) {
+    raw.destroy()
     return
   }
 
@@ -48,28 +56,43 @@ export async function streamContainerLogs(
   const res = reply.raw
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-cache, no-transform',
+    'cache-control': 'private, no-store, no-transform',
     connection: 'keep-alive',
     'x-accel-buffering': 'no',
   })
   res.write(': connected\n\n')
 
   const send = (event: string, data: string): void => {
-    if (res.writableEnded) return
+    if (cleaned || res.writableEnded || res.destroyed) return
     const body = data.split('\n').map((line) => `data: ${line}`).join('\n')
-    res.write(`event: ${event}\n${body}\n\n`)
+    const frame = `event: ${event}\n${body}\n\n`
+    if (res.writableLength + Buffer.byteLength(frame) > MAX_QUEUED_BYTES) {
+      cleanup()
+      res.destroy()
+      return
+    }
+    res.write(frame)
   }
 
   const out = new PassThrough()
-  demux(raw, out, out)
 
   let buffered = ''
+  let bytes = 0
   out.on('data', (chunk: Buffer) => {
+    bytes += chunk.length
+    if (bytes > MAX_LOG_BYTES) {
+      cleanup()
+      res.destroy()
+      return
+    }
     buffered += chunk.toString('utf8')
     const lines = buffered.split('\n')
     // 最后一段可能是不完整的行，留到下一块
     buffered = lines.pop() ?? ''
-    for (const line of lines) send('log', line)
+    for (const line of lines) {
+      send('log', line)
+      if (cleaned) break
+    }
   })
 
   out.on('end', () => {
@@ -79,11 +102,13 @@ export async function streamContainerLogs(
     res.end()
   })
 
-  out.on('error', (err: Error) => {
+  const onError = (err: Error): void => {
     send('error', messageOf(err))
     cleanup()
     res.end()
-  })
+  }
+  out.on('error', onError)
+  raw.on('error', onError)
 
   const heartbeat = setInterval(() => {
     if (!res.writableEnded) res.write(': ping\n\n')
@@ -98,7 +123,10 @@ export async function streamContainerLogs(
     out.destroy()
   }
 
-  req.raw.on('close', cleanup)
+  res.once('close', cleanup)
+  try { demux(raw, out, out) } catch (error) {
+    onError(error instanceof Error ? error : new Error('Log stream failed'))
+  }
 }
 
 function messageOf(err: unknown): string {

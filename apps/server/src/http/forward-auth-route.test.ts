@@ -24,6 +24,33 @@ function build(over: Partial<ForwardAuthDeps> = {}) {
 }
 
 describe('GET /auth/verify', () => {
+  it('checks the original method and browser origin forwarded by the proxy', async () => {
+    const app = build()
+    for (const origin of [undefined, 'https://bob.app.example.com', 'null']) {
+      const res = await app.inject({
+        method: 'GET', url: '/auth/verify',
+        headers: {
+          'x-forwarded-host': 'alice.app.example.com',
+          'x-forwarded-method': 'POST',
+          cookie: 'dsh_cloud.session_token=ok',
+          ...(origin === undefined ? {} : { origin }),
+        },
+      })
+      expect(res.statusCode).toBe(403)
+      expect(res.headers['x-platform-token']).toBeUndefined()
+    }
+    const allowed = await app.inject({
+      method: 'GET', url: '/auth/verify',
+      headers: {
+        'x-forwarded-host': 'alice.app.example.com',
+        'x-forwarded-method': 'POST',
+        cookie: 'dsh_cloud.session_token=ok',
+        origin: 'https://alice.app.example.com',
+      },
+    })
+    expect(allowed.statusCode).toBe(200)
+    await app.close()
+  })
   it('未登录 → 302，location 指向控制台登录页', async () => {
     const res = await build().inject({
       method: 'GET',

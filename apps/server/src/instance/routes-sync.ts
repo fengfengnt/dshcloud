@@ -5,6 +5,7 @@ import type { ContainerStates } from './runtime-status.js'
 import { buildTraefikConfig, type TraefikRoute } from './traefik.js'
 
 export interface RoutesSyncOptions {
+  gatewayAddress?: string
   /** Traefik file provider 监视的目录下的文件名。 */
   configPath: string
   baseDomain: string
@@ -81,6 +82,7 @@ export async function syncRoutesFromInstances(
     opts.configPath,
     buildTraefikConfig(routes, {
       forwardAuthAddress: opts.forwardAuthAddress,
+      ...(opts.gatewayAddress === undefined ? {} : { gatewayAddress: opts.gatewayAddress }),
       ...(opts.upstreamHost === undefined ? {} : { upstreamHost: opts.upstreamHost }),
       ...(opts.entryPoint === undefined ? {} : { entryPoint: opts.entryPoint }),
       ...(opts.tls === undefined ? {} : { tls: opts.tls }),

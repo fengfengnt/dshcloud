@@ -44,11 +44,15 @@ export interface RenderedInstance {
   hostname: string
   image: string
   /**
-   * 工作负载的运行用户。**固定 `'0'`（root）** —— 数据卷的根目录归 root，而
-   * `.owner()` 这类声明式属主映射对命名卷无效，所以工作负载只能是 root。
+   * 工作负载的运行用户，`uid:gid` 形如 `'1000:1000'`（见 `INSTANCE_UID`）。
    *
-   * 这不是「懒得降权」：guest 里能写的只有 `/data`，而它归 root。安全边界是容器本身
-   * （内核命名空间），不是 guest 内的 uid。
+   * 非 root 的理由是**收窄写权限的范围**：容器里那个进程能改的宿主文件，从「全都能」缩到
+   * 「只有它自己那份数据」。它**不改容器的边界** —— 边界是命名空间与能力集。
+   *
+   * 代价是 guest 里再无特权：`apt-get` 这类要写 `/var/lib/dpkg` 的操作失效，系统包改走
+   * 镜像预装（见 D12 的正面冲突记录）。数据卷的属主因此必须由**平台侧在起容器前**改好
+   * （`RuntimeDriver.chownStorage`）—— 容器内降权做不到，`CapDrop: ALL` 下 `su` 一类全是
+   * `EPERM`（D29）。
    */
   user: string
   /**

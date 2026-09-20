@@ -51,12 +51,15 @@ export async function allocateHostPort(deps: PortAllocatorDeps): Promise<number>
  * 这样探到的结果才有意义。
  */
 export function isPortFree(port: number): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
+  return new Promise<boolean>((resolve, reject) => {
     const srv = createServer()
     srv.unref()
-    srv.once('error', () => resolve(false))
+    srv.once('error', (error: NodeJS.ErrnoException) => {
+      if (error.code === 'EADDRINUSE') resolve(false)
+      else reject(new Error(`无法探测宿主回环端口 ${port}: ${error.code ?? error.message}`, { cause: error }))
+    })
     srv.once('listening', () => {
-      srv.close(() => resolve(true))
+      srv.close(error => error ? reject(error) : resolve(true))
     })
     srv.listen({ host: '127.0.0.1', port, exclusive: true })
   })

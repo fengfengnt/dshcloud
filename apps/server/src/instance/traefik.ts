@@ -23,6 +23,7 @@ export const TraefikRouteSchema = z.object({
 export type TraefikRoute = z.infer<typeof TraefikRouteSchema>
 
 export interface TraefikOptions {
+  gatewayAddress?: string
   /** forward-auth 端点（控制面）。 */
   forwardAuthAddress: string
   /**
@@ -96,7 +97,7 @@ export function buildTraefikConfig(routes: TraefikRoute[], opts: TraefikOptions)
       {
         rule: `Host(\`${r.hostname}\`)`,
         service: `instance-${r.instance}`,
-        middlewares: [authName],
+        middlewares: opts.gatewayAddress === undefined ? [authName] : [],
         entryPoints: [entryPoint],
         ...(opts.tls === undefined ? {} : { tls: opts.tls }),
       },
@@ -107,7 +108,7 @@ export function buildTraefikConfig(routes: TraefikRoute[], opts: TraefikOptions)
       `instance-${r.instance}`,
       {
         loadBalancer: {
-          servers: [{ url: `http://${upstreamHost}:${r.hostPort}` }],
+          servers: [{ url: opts.gatewayAddress ?? `http://${upstreamHost}:${r.hostPort}` }],
         },
       },
     ]),

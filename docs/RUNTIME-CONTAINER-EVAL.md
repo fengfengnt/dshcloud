@@ -322,6 +322,14 @@ dsh 的沙箱候选链是 `bwrap → Landlock → 全部失败就拒绝执行任
 是 Docker 的**默认**表、`Config.User=0`（容器里 `tini` / `entrypoint.sh` / `caddy` 全是 root）。
 **实例加固的现状以 [ARCHITECTURE §五](ARCHITECTURE.md) 为准**（那张表是对的）。
 
+> **后续（2026-09-17）**：上段那三项里已有两项补回 —— `MaskedPaths` 覆盖 2026-09-16 设上（默认那
+> 12 条 + `/sys/devices/virtual/dmi`，13 条写死在驱动里，有用例守着），`SecurityOpt` 2026-09-17
+> 设上（`['no-new-privileges']`）。**`CapDrop` 与 `ReadonlyPaths` 仍未设**，补齐顺序见
+> [ISOLATION-PLAN](ISOLATION-PLAN.md)。
+> `Config.User=0` 那句也过期了：2026-09-17 起工作负载以固定的 `1000:1000` 跑（渲染器 + 镜像 +
+> 平台侧的属主迁移，见 [D39](DECISIONS.md)）。
+> 上面那段的 2026-09-13 快照本身不需改 —— 它是带日期的记录，只是别再当作现状读。
+
 **「磁盘硬限还没实现」也已过期**：`apps/server/src/instance/pool.ts` 已经落地 —— 池子探针、
 `pquota`、每实例一个 project quota（字节 + inode 双限）、设不上就**拒绝启动**，见 D18。
 

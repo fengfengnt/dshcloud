@@ -60,5 +60,12 @@ ENV DSH_HOME=/data \
 
 VOLUME ["/data"]
 WORKDIR /data
-USER root
+
+# 必须是**运行用户**的（与 instance-spec 的 INSTANCE_UID 同一个号）。
+# 空卷第一次挂载时 Docker 会把镜像里 /data 的属主拷进卷里 —— 镜像里这个目录若是 root 的，
+# 平台在起容器前改好的属主会被当场顶回 root（2026-09-17 实测：镜像 /data=0:0 时，卷上先
+# chown 成 1000:1000 再挂一次，读回来又是 0:0），工作负载随即写不了盘。
+RUN chown 1000:1000 /data
+
+USER 1000:1000
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]

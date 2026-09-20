@@ -130,6 +130,12 @@ pnpm --filter @dsh-cloud/server test:security
 | 架构 + 安全模型 + 隔离边界 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | 平台隔离需求 / 信任定位 / 升级路径 | [docs/ISOLATION-POSITIONING.md](docs/ISOLATION-POSITIONING.md) |
 | Docker 容器隔离通用参考 | [docs/CONTAINER-ISOLATION.md](docs/CONTAINER-ISOLATION.md) |
+| 隔离分档设计与补齐顺序（T1 / T2） | [docs/ISOLATION-TIERS.md](docs/ISOLATION-TIERS.md) |
+| 隔离加固要做什么 / 做到哪了 | [docs/ISOLATION-PLAN.md](docs/ISOLATION-PLAN.md) |
+| 文献与行业结论（隔离 / 安全 / 隐藏） | [docs/ISOLATION-LITERATURE.md](docs/ISOLATION-LITERATURE.md) |
+| 独立技术文章：上面这些的合并版（可单独发布） | [docs/CONTAINER-ISOLATION-PAPER.md](docs/CONTAINER-ISOLATION-PAPER.md) |
+| 隔离实测的原始记录（两台宿主逐项） | [docs/CONTAINER-ISOLATION-TEST-PLAN.md](docs/CONTAINER-ISOLATION-TEST-PLAN.md) · [docs/CONTAINER-ISOLATION-TEST-REPORT.md](docs/CONTAINER-ISOLATION-TEST-REPORT.md) |
+| 装机人 / 用户的完整旅程 | [docs/USER-JOURNEY.md](docs/USER-JOURNEY.md) |
 | 为什么这么定（ADR） | [docs/DECISIONS.md](docs/DECISIONS.md) |
 | 待验证 / 待定 | [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md) |
 | 改 UI 前必读的视觉约束 | [docs/DESIGN-SYSTEM.md](docs/DESIGN-SYSTEM.md) |

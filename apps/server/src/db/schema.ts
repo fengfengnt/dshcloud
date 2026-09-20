@@ -278,3 +278,20 @@ export type ImageReleaseRow = typeof imageRelease.$inferSelect
 export type ImageCatalogRow = typeof imageCatalog.$inferSelect
 export type PlatformSettingRow = typeof platformSetting.$inferSelect
 export type InvitationRow = typeof invitation.$inferSelect
+
+// Workspace credentials never contain the console session token.
+export const workspaceGrant = pgTable('workspace_grant', {
+  codeHash: text('code_hash').primaryKey(),
+  stateHash: text('state_hash').notNull(),
+  instanceId: text('instance_id').notNull().references(() => instance.id, { onDelete: 'cascade' }),
+  sessionId: text('session_id').notNull().references(() => session.id, { onDelete: 'cascade' }),
+  callbackUrl: text('callback_url').notNull(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+}, t => [index('workspace_grant_expiry_idx').on(t.expiresAt)])
+
+export const workspaceSession = pgTable('workspace_session', {
+  tokenHash: text('token_hash').primaryKey(),
+  instanceId: text('instance_id').notNull().references(() => instance.id, { onDelete: 'cascade' }),
+  sessionId: text('session_id').notNull().references(() => session.id, { onDelete: 'cascade' }),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+}, t => [index('workspace_session_expiry_idx').on(t.expiresAt), index('workspace_session_parent_idx').on(t.sessionId)])

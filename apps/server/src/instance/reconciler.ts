@@ -1,6 +1,7 @@
 import { machineName } from '@dsh-cloud/instance-spec'
 import type { InstancePatch } from '../db/instance-repo.js'
 import type { InstanceRow } from '../db/schema.js'
+import { lifecycleOperations } from './operation-queue.js'
 
 /**
  * 编排正在进行的状态。对账器**不碰**它们——正在跑的动作会自己写状态，
@@ -36,6 +37,10 @@ export interface ReconcileDeps {
  * 真正的死活要看 `probeHealthy`，那条路径挂在 `probe` 依赖上（见 `InstanceOrchestrator.probeHealthy`）。
  */
 export async function reconcileInstances(deps: ReconcileDeps): Promise<{ changed: number }> {
+  return lifecycleOperations.run(() => reconcileUnlocked(deps))
+}
+
+async function reconcileUnlocked(deps: ReconcileDeps): Promise<{ changed: number }> {
   const rows = await deps.listInstances()
   const known = new Set(rows.map((r) => machineName(r.slug)))
   let changed = 0

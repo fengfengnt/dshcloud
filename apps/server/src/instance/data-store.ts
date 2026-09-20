@@ -1,3 +1,4 @@
+import { INSTANCE_GID, INSTANCE_UID } from '@dsh-cloud/instance-spec'
 import type { RuntimeDriver } from '../runtime/driver.js'
 
 export interface DataStoreOptions {
@@ -29,17 +30,8 @@ export interface DiskUsage {
 /**
  * 实例数据的生命周期与策略。
  *
- * **与「宿主目录直挂」那一版 `DataStore` 的根本差别**：这里没有宿主目录、没有 loop 设备、
- * 没有 `mkfs.ext4`、也没有 `nsenter`。数据是一块 **Docker 命名卷**，`storageKey` 就是它的
- * 名字；宿主上长什么样完全不是这个类该知道的事。
- *
- * 为什么用命名卷而不是宿主目录直挂：直挂要走 Docker Desktop 的 VM 共享文件系统那一层，
- * 而它有硬链接语义问题（上游 #1559）——unlink 掉两个名字中的一个，剩下的那个会**永久只读**，
- * 而 dsh 的会话日志每次落盘正是 `tmp → link → rm(tmp)`。命名卷是 VM 里的真文件系统，
- * 没有这个问题。见驱动的类注释。
- *
- * 代价：Docker 命名卷**没有硬容量配额**，声明值只记进卷的 label，所以这里没有任何
- * `resize` / `shrink`。
+ * 这里只决定数据生命周期，不解释宿主路径。生产驱动使用带 XFS 配额的目录，
+ * Docker Desktop 开发环境使用命名卷；两者都必须拒绝覆盖已有的复制目标。
  */
 export class DataStore {
   private readonly driver: RuntimeDriver
@@ -51,6 +43,10 @@ export class DataStore {
   /** 快照卷的 key。回滚只够用一次，用过就删（与 D19 同语义）。 */
   snapshotKey(storageKey: string): string {
     return `${storageKey}.prev`
+  }
+
+  recoveryKey(storageKey: string): string {
+    return `${storageKey}.recovery`
   }
 
   /**
@@ -67,6 +63,20 @@ export class DataStore {
   /** 幂等确保数据卷在。**绝不新建** —— 卷不见了就抛错，让上层看见。 */
   async ensure(storageKey: string): Promise<void> {
     await this.driver.ensureStorage(storageKey)
+  }
+
+  /**
+   * 把这一份数据的属主递归改成平台固定的运行用户。
+   *
+   * **必须在起容器之前调**：工作负载以非 root 跑（`INSTANCE_UID`），而数据目录是 root 建的
+   * —— 属主不对，实例照常起、入口照常响应，agent 跑到一半才写不了盘。容器内补不了这一步
+   * （`CapDrop: ALL` 下 `su` / `setpriv` 全是 `EPERM`，见 D29）。
+   *
+   * 幂等，且判据是**目录的实际属主**而不是库里的状态：回滚会把升级前的旧数据（root 属主）
+   * 盖回来，那时必须重新迁一遍。
+   */
+  async chown(storageKey: string): Promise<void> {
+    await this.driver.chownStorage(storageKey, INSTANCE_UID, INSTANCE_GID)
   }
 
   /**
@@ -118,10 +128,18 @@ export class DataStore {
 
   /** 用 `.prev` 覆盖当前数据。回滚路径专用。 */
   async restoreSnapshot(storageKey: string): Promise<void> {
-    // `copyStorage` 要求目标不存在，所以先把活卷删掉再复制回去。
-    // 调用方（`rollbackTo`）已经停过容器，此时没有东西在用这块卷。
+    // A missing or invalid backup must never cause deletion of the remaining live data.
+    await this.driver.ensureStorage(this.snapshotKey(storageKey))
+    // Preserve current data before any destructive step. An existing recovery copy blocks
+    // retries rather than overwriting evidence from an interrupted operation.
+    await this.driver.copyStorage(storageKey, this.recoveryKey(storageKey))
     await this.driver.removeStorage(storageKey)
     await this.driver.copyStorage(this.snapshotKey(storageKey), storageKey)
+  }
+
+  /** Only after the database and requested runtime state have both been restored. */
+  async finishRestore(storageKey: string): Promise<void> {
+    await this.driver.removeStorage(this.recoveryKey(storageKey))
   }
 
   /** 丢掉 `.prev`。回滚只够用一次，用过就清（与 D19 同语义）。 */
@@ -133,5 +151,6 @@ export class DataStore {
   async destroy(storageKey: string): Promise<void> {
     await this.driver.removeStorage(storageKey)
     await this.driver.removeStorage(this.snapshotKey(storageKey))
+    await this.driver.removeStorage(this.recoveryKey(storageKey))
   }
 }

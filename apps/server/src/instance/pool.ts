@@ -1,7 +1,10 @@
 import { execFile } from 'node:child_process'
-import { mkdir, readFile, rename, rm, stat, statfs, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { lstat, mkdir, open, readFile, readdir, rename, rm, stat, statfs, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
+import { z } from 'zod'
+import { OperationQueue } from './operation-queue.js'
 
 const run = promisify(execFile)
 
@@ -14,8 +17,8 @@ const PROBE_PROJID = 0xfffffffe
 /** 探针目录名。**别用 `.` 开头以外的东西** —— 它只活几毫秒。 */
 const PROBE_DIR = '.dsh-pool-probe'
 
-/** 池子边界检查：key 由平台生成（32 位十六进制，或它的 `.prev`），不接受别的形状。 */
-const KEY_PATTERN = /^[a-f0-9]{32}(\.prev)?$/
+/** Pool keys are generated instance IDs, with optional snapshot or recovery suffixes. */
+const KEY_PATTERN = /^[a-f0-9]{32}(\.(prev|recovery))?$/
 
 export class StoragePoolError extends Error {}
 
@@ -332,6 +335,8 @@ export interface ProjectRecord {
   projid: number
   sizeMb: number
   inodeLimit: number
+  /** Creation/copy has not durably completed; this storage must not be mounted. */
+  pending?: boolean
   /**
    * 墓碑：这条 key 的数据已经删了，但 **id 永久占位**。
    *
@@ -341,6 +346,8 @@ export interface ProjectRecord {
    * 都是先删目录再 release，所以暂时打不到；但那是**调用方的自觉**，不该是注册表的契约。
    */
   released?: boolean
+  /** Earlier allocations of this key remain reserved after snapshot replacement or recovery. */
+  retiredProjids?: number[]
 }
 
 /**
@@ -356,41 +363,81 @@ export interface ProjectRecord {
  * 这种侧信道可读（对比：命名卷那版是从 label 读的）。
  */
 export class ProjectRegistry {
+  private static readonly operations = new OperationQueue(64)
   private readonly path: string
-  private cache: Map<string, ProjectRecord> | undefined
 
   constructor(poolRoot: string) {
     this.path = join(poolRoot, '.dsh-projects.json')
   }
 
   async get(key: string): Promise<ProjectRecord | undefined> {
+    return ProjectRegistry.operations.run(() => this.getUnlocked(key))
+  }
+
+  private async getUnlocked(key: string): Promise<ProjectRecord | undefined> {
     const record = (await this.load()).get(key)
     // 墓碑不算"这条 key 有存储" —— 调用方拿它判断要不要设限额 / 对外报用量
     return record === undefined || record.released === true ? undefined : record
   }
 
   async keys(): Promise<Set<string>> {
-    const map = await this.load()
-    return new Set([...map].filter(([, r]) => r.released !== true).map(([key]) => key))
+    return ProjectRegistry.operations.run(async () => {
+      const map = await this.load()
+      return new Set([...map].filter(([, r]) => r.released !== true).map(([key]) => key))
+    })
+  }
+
+  /** Inspection must never initialize a missing registry or hide released records. */
+  async inspect(): Promise<Map<string, ProjectRecord>> {
+    return ProjectRegistry.operations.run(() => this.load(false))
   }
 
   /** 分配一个**从没用过**的 id、连同限额一起落盘。 */
-  async allocate(key: string, sizeMb: number, inodeLimit: number): Promise<ProjectRecord> {
-    const map = await this.load()
+  async allocate(key: string, sizeMb: number, inodeLimit: number, pending = false): Promise<ProjectRecord> {
+    return ProjectRegistry.operations.run(() => this.allocateUnlocked(key, sizeMb, inodeLimit, pending))
+  }
+
+  private async allocateUnlocked(key: string, sizeMb: number, inodeLimit: number, pending: boolean): Promise<ProjectRecord> {
+    assertStorageKey(key)
+    const map = new Map(await this.load())
+    const previous = map.get(key)
+    if (previous && !previous.released) throw new StoragePoolError('数据卷已有项目编号，拒绝覆盖')
     // 墓碑也要算进来：它们的 id 不许再发出去
-    const taken = new Set([...map.values()].map((r) => r.projid))
+    const taken = new Set([...map.values()].flatMap(r => [r.projid, ...(r.retiredProjids ?? [])]))
     // 从低位往上找第一个空闲的；`1` 留给可能的系统用途。
     let projid = 2
     while (taken.has(projid)) projid++
-    const record: ProjectRecord = { projid, sizeMb, inodeLimit }
+    if (projid >= PROBE_PROJID) throw new StoragePoolError('配额项目编号已耗尽')
+    const record: ProjectRecord = { projid, sizeMb, inodeLimit,
+      ...(pending ? { pending: true } : {}),
+      ...(previous ? { retiredProjids: [...(previous.retiredProjids ?? []), previous.projid] } : {}),
+    }
     map.set(key, record)
     await this.save(map)
     return record
   }
 
+  async complete(key: string, projid: number): Promise<void> {
+    return ProjectRegistry.operations.run(async () => {
+      const map = new Map(await this.load())
+      const record = map.get(key)
+      if (!record || record.released || record.projid !== projid) {
+        throw new StoragePoolError('数据卷项目编号变化，拒绝确认完成')
+      }
+      if (!record.pending) return
+      const { pending: _pending, ...complete } = record
+      map.set(key, complete)
+      await this.save(map)
+    })
+  }
+
   /** 改限额（扩容 / 缩容）。没有这条 key、或它已是墓碑，就什么都不做。 */
   async update(key: string, sizeMb: number, inodeLimit: number): Promise<void> {
-    const map = await this.load()
+    return ProjectRegistry.operations.run(() => this.updateUnlocked(key, sizeMb, inodeLimit))
+  }
+
+  private async updateUnlocked(key: string, sizeMb: number, inodeLimit: number): Promise<void> {
+    const map = new Map(await this.load())
     const record = map.get(key)
     if (record === undefined || record.released === true) return
     map.set(key, { ...record, sizeMb, inodeLimit })
@@ -399,7 +446,11 @@ export class ProjectRegistry {
 
   /** 释放：**留墓碑**，id 不再复用（见 `ProjectRecord.released`）。 */
   async release(key: string): Promise<void> {
-    const map = await this.load()
+    return ProjectRegistry.operations.run(() => this.releaseUnlocked(key))
+  }
+
+  private async releaseUnlocked(key: string): Promise<void> {
+    const map = new Map(await this.load())
     const record = map.get(key)
     if (record === undefined || record.released === true) return
     map.set(key, { ...record, released: true })
@@ -414,7 +465,11 @@ export class ProjectRegistry {
    * 一条墓碑约 60 字节，相对于它挡掉的那类数据事故可以忽略。
    */
   async reconcile(liveKeys: Set<string>): Promise<void> {
-    const map = await this.load()
+    return ProjectRegistry.operations.run(() => this.reconcileUnlocked(liveKeys))
+  }
+
+  private async reconcileUnlocked(liveKeys: Set<string>): Promise<void> {
+    const map = new Map(await this.load())
     let changed = false
     for (const [key, record] of [...map]) {
       if (!liveKeys.has(key) && record.released !== true) {
@@ -425,22 +480,66 @@ export class ProjectRegistry {
     if (changed) await this.save(map)
   }
 
-  private async load(): Promise<Map<string, ProjectRecord>> {
-    if (this.cache !== undefined) return this.cache
+  private async load(initialize = true): Promise<Map<string, ProjectRecord>> {
+    let text: string
     try {
-      const raw = JSON.parse(await readFile(this.path, 'utf8')) as Record<string, ProjectRecord>
-      this.cache = new Map(Object.entries(raw))
-    } catch {
-      this.cache = new Map()
+      text = await readFile(this.path, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      if (!initialize) throw new StoragePoolError('配额注册表缺失，检查不会创建注册表')
+      const entries = await readdir(dirname(this.path))
+      if (entries.includes('.dsh-node.lock')) {
+        const lock = await lstat(join(dirname(this.path), '.dsh-node.lock'))
+        if (!lock.isFile() || lock.isSymbolicLink() || lock.size !== 0) {
+          throw new StoragePoolError('节点锁文件异常，拒绝初始化数据池')
+        }
+      }
+      if (entries.some(name => !['lost+found', '.dsh-node.lock'].includes(name)) ||
+          (entries.includes('lost+found') && (await readdir(join(dirname(this.path), 'lost+found'))).length > 0)) {
+        throw new StoragePoolError('数据池非空但配额注册表缺失，必须恢复注册表，拒绝重新分配编号')
+      }
+      const empty = new Map<string, ProjectRecord>()
+      await this.save(empty)
+      return empty
     }
-    return this.cache
+    const schema = z.record(z.string().regex(KEY_PATTERN), z.object({
+      projid: z.number().int().min(2).max(PROBE_PROJID - 1),
+      sizeMb: z.number().int().positive(),
+      inodeLimit: z.number().int().positive(),
+      pending: z.boolean().optional(),
+      released: z.boolean().optional(),
+      retiredProjids: z.array(z.number().int().min(2).max(PROBE_PROJID - 1)).optional(),
+    }).strict())
+    const parsed = schema.safeParse(JSON.parse(text))
+    if (!parsed.success) throw new StoragePoolError('配额注册表损坏，拒绝重新分配项目编号')
+    const entries = Object.entries(parsed.data)
+    const ids = entries.flatMap(([, value]) => [value.projid, ...(value.retiredProjids ?? [])])
+    if (new Set(ids).size !== ids.length) {
+      throw new StoragePoolError('配额注册表含重复项目编号，拒绝继续')
+    }
+    return new Map(entries.map(([key, value]) => [key, {
+      projid: value.projid, sizeMb: value.sizeMb, inodeLimit: value.inodeLimit,
+      ...(value.pending === undefined ? {} : { pending: value.pending }),
+      ...(value.released === undefined ? {} : { released: value.released }),
+      ...(value.retiredProjids === undefined ? {} : { retiredProjids: value.retiredProjids }),
+    }]))
   }
 
-  /** 原子写：先写临时文件再 rename，别让半截 JSON 留在盘上。 */
+  /** Persist both file contents and the directory entry before acknowledging a new allocation. */
   private async save(map: Map<string, ProjectRecord>): Promise<void> {
-    const tmp = `${this.path}.tmp`
-    await writeFile(tmp, JSON.stringify(Object.fromEntries(map)), 'utf8')
-    await rename(tmp, this.path)
+    const tmp = `${this.path}.${randomUUID()}.tmp`
+    try {
+      const file = await open(tmp, 'wx', 0o600)
+      try {
+        await file.writeFile(JSON.stringify(Object.fromEntries(map)), 'utf8')
+        await file.sync()
+      } finally { await file.close() }
+      await rename(tmp, this.path)
+      const directory = await open(dirname(this.path), 'r')
+      try { await directory.sync() } finally { await directory.close() }
+    } finally {
+      await rm(tmp, { force: true })
+    }
   }
 }
 

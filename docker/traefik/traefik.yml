@@ -22,4 +22,7 @@ log:
   level: INFO
 
 # 验收表要靠它取证（哪些请求被 forward-auth 挡了），别关
-accessLog: {}
+accessLog:
+  fields:
+    names:
+      RequestPath: drop

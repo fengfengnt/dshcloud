@@ -19,11 +19,12 @@ describe.runIf(process.env.DSH_SECURITY_INTEGRATION === '1')('real Traefik sessi
   let port: number
   let receivedCookie: string | undefined
 
-  function getEcho(cookie = ''): Promise<{ status: number; body: string }> {
+  function getEcho(cookie = '', method = 'GET', origin?: string): Promise<{ status: number; body: string }> {
     return new Promise((resolve, reject) => {
       const connection = request({
-        hostname: '127.0.0.1', port, path: '/echo',
-        headers: { Host: 'alice.app.example.com', Cookie: cookie },
+        hostname: '127.0.0.1', port, path: '/echo', method,
+        headers: { Host: 'alice.app.example.com', Cookie: cookie,
+          ...(origin === undefined ? {} : { Origin: origin }) },
       }, response => {
         const chunks: Buffer[] = []
         response.on('data', chunk => chunks.push(Buffer.from(chunk)))
@@ -45,6 +46,7 @@ describe.runIf(process.env.DSH_SECURITY_INTEGRATION === '1')('real Traefik sessi
         ? 'alice' : cookie?.includes('dsh_cloud.session_token=bob') ? 'bob' : undefined,
     })
     backend.get('/echo', async (req) => ({ cookie: req.headers.cookie ?? '', gate: req.headers['x-platform-token'] }))
+    backend.post('/echo', async () => ({ accepted: true }))
     backend.get('/socket', async (req, reply) => {
       receivedCookie = req.headers.cookie
       const accept = createHash('sha1').update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
@@ -103,16 +105,20 @@ describe.runIf(process.env.DSH_SECURITY_INTEGRATION === '1')('real Traefik sessi
   })
 
   it.each([
-    ['', 302],
-    ['dsh_cloud.session_token=bob', 403],
-    ['dsh_cloud.session_token=alice; dsh_session=instance', 101],
-  ])('authorizes WebSocket upgrades and filters their cookies: %s', async (cookie, expected) => {
+    ['', 302, 'https://alice.app.example.com'],
+    ['dsh_cloud.session_token=bob', 403, 'https://alice.app.example.com'],
+    ['dsh_cloud.session_token=alice; dsh_session=instance', 101, 'https://alice.app.example.com'],
+    ['dsh_cloud.session_token=alice', 403, 'https://bob.app.example.com'],
+    ['dsh_cloud.session_token=alice', 403, 'https://evil.example'],
+    ['dsh_cloud.session_token=alice', 403, 'null'],
+  ] as const)('authorizes WebSocket upgrades and filters their cookies: %s', async (cookie, expected, origin) => {
     receivedCookie = undefined
     const code = await new Promise<number>((resolve, reject) => {
       const connection = request({
         hostname: '127.0.0.1', port, path: '/socket',
         headers: {
           Host: 'alice.app.example.com', Cookie: cookie,
+          Origin: origin,
           Connection: 'Upgrade', Upgrade: 'websocket',
           'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
         },
@@ -131,5 +137,16 @@ describe.runIf(process.env.DSH_SECURITY_INTEGRATION === '1')('real Traefik sessi
     })
     expect(code).toBe(expected)
     expect(receivedCookie).toBe(expected === 101 ? 'dsh_session=instance' : undefined)
+  })
+
+  it.each([undefined, 'null', 'https://bob.app.example.com', 'https://console.app.example.com'])(
+    'rejects cross-origin writes before reaching an unguarded backend: %s', async (origin) => {
+      expect((await getEcho('dsh_cloud.session_token=alice', 'POST', origin)).status).toBe(403)
+    },
+  )
+  it('allows owner writes from the exact workspace origin', async () => {
+    const response = await getEcho('dsh_cloud.session_token=alice', 'POST', 'https://alice.app.example.com')
+    expect(response.status).toBe(200)
+    expect(JSON.parse(response.body)).toEqual({ accepted: true })
   })
 })

@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>用户旅程 · dshcloud</title>
+<style>
+  /* 平台设计 token：零彩度中性轴 + 品牌绿（apps/web/src/index.css 同一套） */
+  :root {
+    --bg: oklch(0.99 0 0);
+    --fg: oklch(0.145 0 0);
+    --card: oklch(1 0 0);
+    --muted: oklch(0.967 0 0);
+    --muted-fg: oklch(0.552 0 0);
+    --border: oklch(0.922 0 0);
+    --primary: oklch(0.536 0.095 181.5);
+    --primary-fg: oklch(0.985 0 0);
+    --destructive: oklch(0.577 0.245 27.325);
+    --radius: 10px;
+    --font: 'Noto Sans SC Variable','PingFang SC','Microsoft YaHei',ui-sans-serif,system-ui,sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: oklch(0.155 0 0);
+      --fg: oklch(0.985 0 0);
+      --card: oklch(0.19 0 0);
+      --muted: oklch(0.218 0 0);
+      --muted-fg: oklch(0.65 0 0);
+      --border: oklch(0.32 0 0);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: var(--font); line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 48px 24px 96px; }
+  h1 { font-size: 26px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 6px; }
+  .sub { color: var(--muted-fg); font-size: 14px; margin: 0 0 40px; }
+  h2 { font-size: 17px; font-weight: 600; margin: 56px 0 4px; }
+  h2 .no { color: var(--primary); font-variant-numeric: tabular-nums; margin-right: 8px; }
+  .lede { color: var(--muted-fg); font-size: 14px; margin: 0 0 20px; }
+  code { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 0.86em;
+         background: var(--muted); padding: 1px 5px; border-radius: 4px; }
+
+  /* ---------- 旅程主图 ---------- */
+  .journey { position: relative; }
+  /* 竖向时间轴：一条线 + 六个站点 */
+  .journey::before {
+    content: ''; position: absolute; left: 21px; top: 14px; bottom: 14px;
+    width: 2px; background: linear-gradient(var(--border), var(--border));
+  }
+  .stage { position: relative; padding-left: 64px; margin: 0 0 34px; }
+  .stage .dot {
+    position: absolute; left: 6px; top: 2px; width: 32px; height: 32px;
+    border-radius: 50%; background: var(--card); border: 2px solid var(--primary);
+    color: var(--primary); font-weight: 700; font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .stage header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+  .stage header h3 { margin: 0; font-size: 15.5px; font-weight: 600; }
+  .stage header .who { color: var(--muted-fg); font-size: 13px; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+          border: 1px solid var(--border); border-radius: var(--radius);
+          background: var(--card); overflow: hidden; }
+  .pair .col { padding: 14px 18px; font-size: 13.5px; }
+  .pair .col + .col { border-left: 1px solid var(--border); }
+  .pair .col h4 {
+    margin: 0 0 8px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em;
+    color: var(--muted-fg); text-transform: uppercase;
+  }
+  .pair .do { color: var(--fg); }
+  .pair .do::before { content: ''; display: inline-block; width: 6px; height: 6px;
+    border-radius: 50%; background: var(--primary); margin-right: 8px;
+    vertical-align: 2px; }
+  .pair .happen { color: var(--muted-fg); }
+  .pair .happen b { color: var(--fg); font-weight: 600; }
+  .pair .happen code { font-size: 12px; }
+  @media (max-width: 720px) {
+    .pair { grid-template-columns: 1fr; }
+    .pair .col + .col { border-left: none; border-top: 1px solid var(--border); }
+  }
+
+  /* 打开工作空间那一步的三个出口 */
+  .branch { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 12px 0 0; }
+  .branch .b {
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+    font-size: 12.5px; color: var(--muted-fg); background: var(--card);
+  }
+  .branch .b b { display: block; font-size: 12.5px; color: var(--fg); margin-bottom: 2px; }
+  .branch .b .code { font-family: ui-monospace, Menlo, monospace; color: var(--primary); font-weight: 600; }
+  .branch .b.bad .code { color: var(--destructive); }
+  @media (max-width: 720px) { .branch { grid-template-columns: 1fr; } }
+
+  /* ---------- 三道门 ---------- */
+  .gates { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .gate { border: 1px solid var(--border); border-radius: var(--radius);
+          padding: 16px 16px 14px; background: var(--card); position: relative; }
+  .gate .tag { font-size: 11px; letter-spacing: 0.08em; color: var(--muted-fg);
+               text-transform: uppercase; font-weight: 600; }
+  .gate h4 { margin: 4px 0 8px; font-size: 14.5px; }
+  .gate p { margin: 0; font-size: 13px; color: var(--muted-fg); }
+  .gate .where { margin-top: 10px; font-size: 12px; color: var(--fg); }
+  .gate .where::before { content: '📍'; margin-right: 4px; }
+  .gate .verdict { position: absolute; top: 14px; right: 14px; font-size: 11px;
+    padding: 2px 8px; border-radius: 99px; font-weight: 600; }
+  .gate .verdict.in { background: var(--primary); color: var(--primary-fg); }
+  .gate .verdict.out { background: var(--muted); color: var(--muted-fg); }
+  .gate.out { opacity: 0.88; }
+  .arrowline { text-align: center; color: var(--muted-fg); font-size: 12.5px; margin: 10px 0; }
+  @media (max-width: 720px) { .gates { grid-template-columns: 1fr; } }
+
+  /* ---------- 旅程 ↔ 边界对照表 ---------- */
+  table { width: 100%; border-collapse: collapse; font-size: 13px;
+          border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  th { text-align: left; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+       color: var(--muted-fg); background: var(--muted); padding: 10px 14px; font-weight: 600;
+       white-space: nowrap; }
+  td { padding: 11px 14px; border-top: 1px solid var(--border); vertical-align: top; }
+  td.step { white-space: nowrap; font-weight: 600; color: var(--primary); width: 3.5em; }
+  td b { font-weight: 600; }
+  .num { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+
+  footer { margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--border);
+           color: var(--muted-fg); font-size: 12.5px; }
+  footer a { color: var(--primary); text-decoration: none; }
+  @media print {
+    .stage, .gate, .pair { break-inside: avoid; }
+    body { background: white; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>用户旅程</h1>
+  <p class="sub">两类人，两条路 —— <b>装机人</b>从一行 curl 到平台可用，<b>普通用户</b>从邀请链接到删除工作空间。</p>
+  <p class="sub" style="color: var(--primary); font-weight: 600; margin: -30px 0 34px;">A · 装机人的旅程（宿主上 · 一次性）</p>
+
+  <!-- ================= 装机人 A ================= -->
+  <div class="journey">
+
+    <div class="stage">
+      <div class="dot">A1</div>
+      <header><h3>跑一行安装</h3><span class="who">宿主机上 · root · 一行也不问</span></header>
+      <div class="pair">
+        <div class="col">
+          <h4>装机人的操作</h4>
+          <div class="do">把 README 里那行 <code>curl … install.sh | bash</code> 贴进终端</div>
+        </div>
+        <div class="col">
+          <h4>实际发生的事情</h4>
+          <div class="happen">四件事，<b>顺序不能换</b>：预检（环境 / 端口 / 存储能力，含 firewalld 冲突探查）→ 宿主上预置存储池 → 取部署资产渲染配置 → 起 Postgres、迁移、起控制面。安装这一步<b>一个问题都不问</b>：账号和域名都不归它管</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="dot">A2</div>
+      <header><h3>拿到一行地址</h3><span class="who">终端打印 · 唯一要复制的东西</span></header>
+      <div class="pair">
+        <div class="col">
+          <h4>装机人的操作</h4>
+          <div class="do">复制终端最后打印的那条 <code>http://&lt;机器地址&gt;:&lt;端口&gt;/setup?token=…</code>，用浏览器打开</div>
+        </div>
+        <div class="col">
+          <h4>实际发生的事情</h4>
+          <div class="happen">那一刻平台上<b>还没有账号也没有域名</b>，这页是唯一入口，token 是它唯一的凭证 —— 引导态下整站只开着这一条写口。重跑安装<b>不会</b>换掉它：刻意保留，换了就等于把刚打印给你的链接作废</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="dot">A3</div>
+      <header><h3>引导页里建管理员、填域名</h3><span class="who">浏览器 · 一页填完</span></header>
+      <div class="pair">
+        <div class="col">
+          <h4>装机人的操作</h4>
+          <div class="do">填管理员邮箱、密码、父域；顺手把 <code>*.&lt;域名&gt;</code> 的泛解析指过来</div>
+        </div>
+        <div class="col">
+          <h4>实际发生的事情</h4>
+          <div class="happen">页面边填边<b>真探 DNS</b>：解析没就绪会直接给出要加的两条记录。提交后 <b>立刻关掉这个入口并重启</b> —— 明文的引导口不会留在 80 上；控制台从此落在 <code>console.&lt;域名&gt;</code>。ACME 正在签证书，头一分钟报证书错是正常的</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="dot">A4</div>
+      <header><h3>补上实例镜像</h3><span class="who">管理台 · 最后一块拼图</span></header>
+      <div class="pair">
+        <div class="col">
+          <h4>装机人的操作</h4>
+          <div class="do">登录管理台，进「镜像管理」，把实例镜像设为默认</div>
+        </div>
+        <div class="col">
+          <h4>实际发生的事情</h4>
+          <div class="happen">没有默认实例镜像时平台建不了工作空间 —— 装机到此才真正可用。之后日常只剩一条命令：<code>install.sh</code> 重跑即升级（幂等，<b>除非 <code>FORCE_SECRETS=1</code>，绝不重生成 secret</b> —— 换了它，所有实例的门 token 全废）</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <p class="sub" style="color: var(--primary); font-weight: 600; margin: 24px 0 34px;">B · 普通用户的旅程（从邀请到删除）</p>
+
+  <!-- ================= 用户旅程 B ================= -->
+  <div class="journey">
+
+    <div class="stage">
+      <div class="dot">①</div>
+      <header><h3>受邀进来</h3><span class="who">装机人在管理台发出邀请 · 没有公开注册</span></header>
+      <div class="pair">
+        <div class="col">
+          <h4>用户的操作</h4>
+          <div class="do">点开邮箱里的邀请链接，设置密码</div>
+        </div>
+        <div class="col">
+          <h4>实际发生的事情</h4>
+          <div class="happen">邀请码核销、账号落库。并发点开同一链接时，<b>真正的闸门是邮箱唯一约束</b>；随后发会话 cookie（Lax、覆盖父域 —— 以后在实例子域上认人要靠它）</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="dot">②</div>
+      <header><h3>建工作空间</h3><span class="who">控制台 · CreateWorkspacePage</span></header>
+      <div class="pair">
+        <div class="col">
+          <h4>用户的操作</h4>
+          <div class="do">填名字、内存、核数、磁盘、镜像版本，点「创建」</div>
+        </div>
+        <div class="col">
+          <h4>实际发生的事情</h4>
+          <div class="happen">
+            <b>先有数据，再有实例</b>，五步有先后，任何一步失败实例标 error：
+            <ol style="margin:6px 0 0;padding-left:1.2em">
+              <li>建数据目录 + XFS 配额（字节与 inode 双限）</li>
+              <li>真探宿主端口空闲，分配回环端口</li>
+              <li>建独立网络 <code>dsh-net-&lt;slug&gt;</code></li>
+              <li>建容器并启动（入口脚本起 dsh + Caddy 桥）</li>
+              <li>落路由：<code>slug.域名 → 127.0.0.1:&lt;port&gt;</code></li>
+            </ol>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="dot">③</div>
+      <header><h3>打开工作空间</h3><span class="who">浏览器 · slug.域名</span></header>
+      <div class="pair">
+        <div class="col">
+          <h4>用户的操作</h4>
+          <div class="do">点「打开工作空间」，新标签页进入自己的子域</div>
+        </div>
+        <div class="col">
+          <h4>实际发生的事情</h4>
+          <div class="happen">Traefik 把<b>每个请求</b>先送控制面认人（forward-auth），是主人才注入按 slug 派生的门 token 转发；容器里 Caddy 验这道 token，再由 dsh 把入口 token 换成 cookie —— 此后地址栏一直是裸域名</div>
+        </div>
+      </div>
+      <div class="branch">
+        <div class="b bad"><b>未登录</b><span class="code">302 → 登录页</span>带上 next，登录完跳回来</div>
+        <div class="b bad"><b>不是本人</b><span class="code">403</span>知道这个子域的人不少，能进门的只有主人</div>
+        <div class="b"><b>是主人</b><span class="code">200 + 门 token</span>token 按 slug 派生，每个实例一份</div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="dot">④</div>
+      <header><h3>日常使用</h3><span class="who">工作空间内 · 编码 agent</span></header>
+      <div class="pair">
+        <div class="col">
+          <h4>用户的操作</h4>
+          <div class="do">让 agent 装依赖、跑命令、读写文件、开仓库</div>
+        </div>
+        <div class="col">
+          <h4>实际发生的事情</h4>
+          <div class="happen">全部发生在<b>一个容器 + 绑定存储</b>里。装包、出网、写文件是本职功能 —— 隔离的目标不是拦它们，而是把影响范围限在单个实例内：邻居够不着（独立网络）、磁盘有硬限（XFS 配额）、CPU / 内存 / 进程数由 cgroup 限着</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="dot">⑤</div>
+      <header><h3>升级镜像</h3><span class="who">管理台 · 按实例灰度，不是全站一刀切</span></header>
+      <div class="pair">
+        <div class="col">
+          <h4>用户的操作</h4>
+          <div class="do">在管理台给这个实例选一个新镜像版本</div>
+        </div>
+        <div class="col">
+          <h4>实际发生的事情</h4>
+          <div class="happen">停容器 → <b>先给 /data 打快照</b> → 落库 → 按新镜像重建。新镜像起不来时<b>自动回滚</b>：数据回快照、镜像回旧版，然后才报错说明原因</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="dot">⑥</div>
+      <header><h3>删除</h3><span class="who">确认之后不可恢复</span></header>
+      <div class="pair">
+        <div class="col">
+          <h4>用户的操作</h4>
+          <div class="do">点删除、确认</div>
+        </div>
+        <div class="col">
+          <h4>实际发生的事情</h4>
+          <div class="happen">先优雅停机（让 dsh 把未落盘的会话写完），然后<b>数据真删</b>：容器、数据目录、升级快照、配额账一起清掉；记录留成「退役主机名」，路由条目跟着消失</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ================= 三道门 ================= -->
+  <h2><span class="no">补</span>③ 那一步里的三道门</h2>
+  <p class="lede">三个「门」不是重复设防 —— 它们挡的是三种不同的来客。判断一道门算不算边界，看它的配置放在谁手里。</p>
+  <div class="gates">
+    <div class="gate">
+      <span class="verdict in">计入边界</span>
+      <div class="tag">门外 · 认人</div>
+      <h4>forward-auth</h4>
+      <p>每个请求先到控制面：这个子域是谁的？未登录跳登录、不是本人 403，是主人才放行。</p>
+      <div class="where">控制面（容器外）</div>
+    </div>
+    <div class="gate out">
+      <span class="verdict out">不算边界</span>
+      <div class="tag">门内 · 验票</div>
+      <h4>Caddy 门①</h4>
+      <p>验 Traefik 注入的门 token。它挡的是宿主上直连回环端口的其他本地进程 —— 端口发布在宿主回环上，任何本地进程都够得着。</p>
+      <div class="where">容器内（配置主人可改）</div>
+    </div>
+    <div class="gate out">
+      <span class="verdict out">不算边界</span>
+      <div class="tag">门内 · 会话</div>
+      <h4>dsh 门②</h4>
+      <p>把入口 token 换成绑 Host 的 cookie，让地址栏保持裸域名 —— URL 里不出现 token。</p>
+      <div class="where">容器内（产品功能）</div>
+    </div>
+  </div>
+  <p class="arrowline">规则只有一条：<b>配置住在容器可写空间里的，都不写进安全论证</b> —— 它是有效障碍，但能关掉它的只有实例主人。</p>
+
+  <!-- ================= 旅程 ↔ 边界 ================= -->
+  <h2><span class="no">对</span>旅程每一步背后的边界（实测过）</h2>
+  <p class="lede">用户在旅程里感知不到这些数字，它们是隔离方案要维护的东西。全部来自两台宿主上可复现的实测。</p>
+  <table>
+    <thead><tr><th>旅程动作</th><th>背后的边界与实测数字</th></tr></thead>
+    <tbody>
+      <tr><td class="step">② 创建</td>
+          <td><b>XFS project quota</b> —— 限 256 MiB 写 400 MiB，停在 256；inode 限 2000，建到第 1998 个被拒；实例内 <span class="num">df</span> 报配额 256M，不报池子的 448M</td></tr>
+      <tr><td class="step">③ 打开</td>
+          <td><b>每实例一个网络</b> —— 邻居 <span class="num">TIMEOUT</span>、ARP 表只剩网关一条；接默认桥时邻居 <span class="num">:8080</span> 直接可达（反面对照）</td></tr>
+      <tr><td class="step">③ 打开</td>
+          <td><b>桥端口只发布宿主回环</b> —— 实例够不到宿主回环；够得到非回环（实测宿主 <span class="num">:22</span> 可达），这条由 <code>--harden-host</code> 堵</td></tr>
+      <tr><td class="step">④ 干活</td>
+          <td><b>cgroup</b> —— <span class="num">pids.max</span> / <span class="num">memory.max</span> 与界面设置逐项一致（真机在跑实例：512 / 2 GiB）</td></tr>
+      <tr><td class="step">④ 干活</td>
+          <td><b>遮蔽表 13 条写死</b> —— 含 <code>/sys/devices/virtual/dmi</code>：宿主是不是虚拟机、什么机型，实例读不到</td></tr>
+    </tbody>
+  </table>
+
+  <footer>
+    链路以代码为准（forward-auth.ts · provisioner.ts · Caddyfile · entrypoint.sh），数字以 <a href="CONTAINER-ISOLATION-TEST-REPORT.md">CONTAINER-ISOLATION-TEST-REPORT</a> 的实测为准。配套：<a href="USER-JOURNEY.md">USER-JOURNEY.md</a>（本文的 mermaid 版）· <a href="ISOLATION-PLAN.md">ISOLATION-PLAN.md</a>。
+  </footer>
+</div>
+</body>
+</html>

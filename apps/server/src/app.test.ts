@@ -51,6 +51,43 @@ function dependencies(
 }
 
 describe('platform account boundaries', () => {
+  it.each([false, true])('protects console responses against framing in bootstrap=%s', async bootstrap => {
+    const app = await buildApp({ ...dependencies(), bootstrap })
+    try {
+      for (const url of ['/healthz', '/missing-page']) {
+        const response = await app.inject({ method: 'GET', url })
+        expect(response.headers['x-frame-options']).toBe('DENY')
+        expect(response.headers['content-security-policy']).toBe("frame-ancestors 'none'")
+        expect(response.headers['referrer-policy']).toBe('no-referrer')
+        expect(response.headers['x-content-type-options']).toBe('nosniff')
+      }
+    } finally { await app.close() }
+  })
+  it('expires old parent-domain cookies without replacing new login cookies', async () => {
+    const deps = dependencies()
+    vi.mocked(deps.auth.handler).mockResolvedValue(new Response('{}', {
+      headers: { 'set-cookie': '__Host-dsh_cloud.session_token=new; Path=/; Secure; HttpOnly' },
+    }))
+    const app = await buildApp(deps)
+    try {
+      const response = await app.inject({
+        method: 'GET', url: '/api/auth/get-session', headers: {
+          host: 'console.app.example.com',
+          cookie: '__Secure-dsh_cloud.session_token=old; dsh_cloud.session_data.0=cache; __Host-dsh_cloud.session_token=new; unrelated=keep',
+        },
+      })
+      const cookies = response.headers['set-cookie'] as string[]
+      expect(cookies).toHaveLength(3)
+      expect(cookies).toContain('__Host-dsh_cloud.session_token=new; Path=/; Secure; HttpOnly')
+      for (const name of ['__Secure-dsh_cloud.session_token', 'dsh_cloud.session_data.0']) {
+        const deletion = cookies.find(value => value.startsWith(`${name}=`))!
+        expect(deletion).toContain('Domain=app.example.com')
+        expect(deletion).toContain('Max-Age=0')
+      }
+      expect(cookies.some(value => value.startsWith('unrelated='))).toBe(false)
+      expect(response.headers['cache-control']).toBe('no-store')
+    } finally { await app.close() }
+  })
   it.each([undefined, 'null', 'https://alice.app.example.com', 'https://evil.example']) (
     'rejects write requests from origin %s before authentication',
     async (origin) => {
@@ -216,19 +253,22 @@ describe('platform admin role guard', () => {
  * `"url":"/setup?token=…"` 出现了三次），所以记之前必须抹掉。
  */
 describe('日志里的 token', () => {
-  it('query 里的 token 被抹掉，其余 query 保留', () => {
-    expect(redactToken('/setup?token=deadbeef&x=1')).toBe('/setup?token=<redacted>&x=1')
+  it('整个查询串不进入日志', () => {
+    expect(redactToken('/setup?token=deadbeef&x=1')).toBe('/setup?<redacted>')
     expect(redactToken('/api/setup/probe?baseDomain=example.com&token=deadbeef')).toBe(
-      '/api/setup/probe?baseDomain=example.com&token=<redacted>',
+      '/api/setup/probe?<redacted>',
     )
   })
 
   it('没有 token 的 URL 原样保留', () => {
     expect(redactToken('/api/setup/state')).toBe('/api/setup/state')
-    expect(redactToken('/api/instances?page=2')).toBe('/api/instances?page=2')
+    expect(redactToken('/api/instances?page=2')).toBe('/api/instances?<redacted>')
   })
 
   it('大小写都认（URL 里的参数名不保证小写）', () => {
-    expect(redactToken('/setup?Token=deadbeef')).toBe('/setup?Token=<redacted>')
+    expect(redactToken('/setup?Token=deadbeef')).toBe('/setup?<redacted>')
+  })
+  it.each(['%63ode=secret', 'next=https%3A%2F%2Fexample.test%2F%3Fcode%3Dsecret'])('编码与嵌套参数也不进入日志', query => {
+    expect(redactToken(`/login?${query}`)).toBe('/login?<redacted>')
   })
 })

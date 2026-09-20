@@ -23,6 +23,7 @@ import { gateToken } from './gate-token.js'
 import { imageRepo, isReleaseTag } from './image-catalog.js'
 import type { InstanceOrchestrator } from './orchestrator.js'
 import { allocateHostPort } from './port-allocator.js'
+import { lifecycleOperations } from './operation-queue.js'
 
 export interface ProvisionInput {
   slug: string
@@ -104,6 +105,10 @@ export class InstanceProvisioner {
   ) {}
 
   async create(input: ProvisionInput): Promise<InstanceRow> {
+    return lifecycleOperations.run(() => this.createUnlocked(input))
+  }
+
+  private async createUnlocked(input: ProvisionInput): Promise<InstanceRow> {
     // 没自选就用库里的默认版本（D21）——没有就响亮失败，别拿一个过期 env 顶上
     const image = input.image ?? (await findDefaultImageRelease(this.db))?.ref
     if (image === undefined) {
@@ -140,6 +145,10 @@ export class InstanceProvisioner {
 
   /** 用同一份规格重建容器（换镜像 / 修复崩溃）。**卷不动**，所以内容保留。 */
   async restart(id: string): Promise<InstanceRow> {
+    return lifecycleOperations.run(() => this.restartUnlocked(id))
+  }
+
+  private async restartUnlocked(id: string): Promise<InstanceRow> {
     const row = await findInstanceById(this.db, id)
     if (row === undefined) throw new Error(`实例不存在：${id}`)
 
@@ -158,6 +167,10 @@ export class InstanceProvisioner {
    * 停下来的实例不进 Traefik 投影，所以同步一次路由把它摘掉。
    */
   async stop(id: string): Promise<InstanceRow> {
+    return lifecycleOperations.run(() => this.stopUnlocked(id))
+  }
+
+  private async stopUnlocked(id: string): Promise<InstanceRow> {
     const row = await findInstanceById(this.db, id)
     if (row === undefined) throw new Error(`实例不存在：${id}`)
 
@@ -178,6 +191,10 @@ export class InstanceProvisioner {
    * （见 `DockerDriver.create`），用户看到「数据没了」（D18）。
    */
   async start(id: string): Promise<InstanceRow> {
+    return lifecycleOperations.run(() => this.startUnlocked(id))
+  }
+
+  private async startUnlocked(id: string): Promise<InstanceRow> {
     const row = await findInstanceById(this.db, id)
     if (row === undefined) throw new Error(`实例不存在：${id}`)
     if (row.containerId === null) return this.applyRuntime(row)
@@ -215,6 +232,10 @@ export class InstanceProvisioner {
    * 顺序有意如此：先摘路由再删容器，否则容器删到一半时流量还会打进来。
    */
   async remove(id: string, opts: RemoveInput): Promise<void> {
+    return lifecycleOperations.run(() => this.removeUnlocked(id, opts))
+  }
+
+  private async removeUnlocked(id: string, opts: RemoveInput): Promise<void> {
     const row = await findInstanceById(this.db, id)
     if (row === undefined) throw new Error(`实例不存在：${id}`)
     if (opts.confirmSlug !== row.slug) {
@@ -255,6 +276,10 @@ export class InstanceProvisioner {
    * （否则 `start` 会复用旧容器、带着旧配额起来），等用户自己 `start`。
    */
   async setQuota(id: string, quota: QuotaInput): Promise<InstanceRow> {
+    return lifecycleOperations.run(() => this.setQuotaUnlocked(id, quota))
+  }
+
+  private async setQuotaUnlocked(id: string, quota: QuotaInput): Promise<InstanceRow> {
     const row = await findInstanceById(this.db, id)
     if (row === undefined) throw new Error(`实例不存在：${id}`)
 
@@ -281,7 +306,7 @@ export class InstanceProvisioner {
 
     if (rebuild) {
       if (row.containerId !== null) await this.orchestrator.removeInstance(machineName(row.slug))
-      return wasRunning ? this.restart(id) : updated
+      return wasRunning ? this.restartUnlocked(id) : updated
     }
 
     return updated
@@ -305,6 +330,14 @@ export class InstanceProvisioner {
     image: string,
     opts: { allowAny?: boolean } = {},
   ): Promise<InstanceRow> {
+    return lifecycleOperations.run(() => this.setImageUnlocked(id, image, opts))
+  }
+
+  private async setImageUnlocked(
+    id: string,
+    image: string,
+    opts: { allowAny?: boolean },
+  ): Promise<InstanceRow> {
     const row = await findInstanceById(this.db, id)
     if (row === undefined) throw new Error(`实例不存在：${id}`)
     if (image === row.image) return row
@@ -318,12 +351,19 @@ export class InstanceProvisioner {
     //    停下之后卷才是最新的状态，才谈得上打快照。
     await this.orchestrator.stopInstance(machineName(row.slug))
 
-    // ② 快照数据卷。失败时机器已停、数据一个字节没动——按原规格重建就回到原样。
+    // The next snapshot replaces the old one. Invalidate its image binding first,
+    // so a crash cannot pair the new data with an older rollback image.
+    if (row.previousImage !== null) {
+      const invalidated = await updateInstance(this.db, row.id, { previousImage: null })
+      if (invalidated === undefined) throw new Error(`实例不存在：${id}`)
+    }
+
+    // ② 快照失败不修改当前数据，但旧回滚点可能已失效。
     try {
       await this.dataStore.snapshot(row.storageKey)
     } catch (err) {
-      if (wasRunning) await this.restart(id)
-      throw new ImageRejectedError(`升级前打快照失败，实例未改动：${messageOf(err)}`)
+      if (wasRunning) await this.restartUnlocked(id)
+      throw new ImageRejectedError(`升级前打快照失败，当前数据未改动，原回滚点可能已失效：${messageOf(err)}`)
     }
 
     // ③ 落库：新镜像 + 记下旧镜像（非空 = 有一份快照可回滚）
@@ -338,7 +378,7 @@ export class InstanceProvisioner {
     if (!wasRunning) return updated
 
     try {
-      return await this.restart(id)
+      return await this.restartUnlocked(id)
     } catch (err) {
       try {
         // 用**升级前**的 wasRunning 决定要不要拉起来：此刻 DB 里的状态已被
@@ -366,11 +406,19 @@ export class InstanceProvisioner {
    * 就走一次正常升级（会重新打快照）。
    */
   async rollbackImage(id: string): Promise<InstanceRow> {
+    return lifecycleOperations.run(() => this.rollbackImageUnlocked(id))
+  }
+
+  private async rollbackImageUnlocked(id: string): Promise<InstanceRow> {
     const row = await findInstanceById(this.db, id)
     if (row === undefined) throw new Error(`实例不存在：${id}`)
     if (row.previousImage === null) throw new NoRollbackError()
 
-    return this.rollbackTo(id, row.previousImage, row.status === 'running')
+    try {
+      return await this.rollbackTo(id, row.previousImage, row.status === 'running')
+    } catch (error) {
+      return this.failWith(id, error)
+    }
   }
 
   /**
@@ -386,20 +434,29 @@ export class InstanceProvisioner {
   ): Promise<InstanceRow> {
     const row = await findInstanceById(this.db, id)
     if (row === undefined) throw new Error(`实例不存在：${id}`)
+    const pending = await updateInstance(this.db, row.id, { status: 'provisioning' })
+    if (pending === undefined) throw new Error(`实例不存在：${id}`)
+    await this.syncRoutes()
     // 先优雅停（把未落盘的写入写完），再用快照覆盖 —— 顺序反了就会拿旧数据
     // 盖掉刚写完的新数据。
     await this.orchestrator.stopInstance(machineName(row.slug))
 
+    // A stopped container retains its old mounts. Never allow it to restart against
+    // data being replaced, even if copying or committing the restored version fails.
+    await this.orchestrator.removeInstance(machineName(row.slug))
     await this.dataStore.restoreSnapshot(row.storageKey)
 
     const updated = await updateInstance(this.db, row.id, {
       image: previousImage,
       previousImage: null,
       containerId: null,
+      status: 'stopped',
     })
     if (updated === undefined) throw new Error(`实例不存在：${id}`)
 
-    return rebuild ? this.restart(id) : updated
+    const result = rebuild ? await this.restartUnlocked(id) : updated
+    await this.dataStore.finishRestore(row.storageKey)
+    return result
   }
 
   /**
@@ -494,9 +551,16 @@ export class InstanceProvisioner {
     if (opts.createData === true) await this.dataStore.create(row.storageKey, row.diskMb)
     else await this.dataStore.ensure(row.storageKey)
 
-    // ★ 镜像也要**先有**。宿主上被 prune 掉之后再重建，运行时只会甩一句
-    // `No such image`；这里补拉一次，把「镜像没了」和「规格写错了」区分开。
+    // Download failures must not stop an otherwise usable workspace.
     await this.orchestrator.ensureImage(row.image)
+    // Use the stable name even if an interrupted operation lost the recorded container ID.
+    await this.orchestrator.stopInstance(machineName(row.slug))
+
+    // 属主要跟数据一起就位：工作负载以固定非 root 跑（`INSTANCE_UID`），而数据目录是 root 建的
+    // ——漏了这一步，实例照常起、入口照常响应，agent 跑到一半才写不了盘（**静默失败**）。
+    // 幂等且判据是**目录的实际属主**，所以每次建容器都调；回滚把旧数据（root 属主）盖回来时，
+    // 它自然会把那一份重新迁一遍。
+    await this.dataStore.chown(row.storageKey)
 
     // 宿主端口：**已有就沿用**——重启不能换地址，否则 Traefik 的路由会指向别处。
     // 没有才分配，分配时会真探端口（不能只信 DB，见 port-allocator）。

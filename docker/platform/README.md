@@ -118,12 +118,21 @@ docker image inspect ghcr.io/eskim2001/dsh-instance:<tag> \
 
 ## 两条要说明白的边界
 
-1. **`cap_add: [SYS_ADMIN]` 叠加 `docker.sock` 等于宿主 root。** 这**不新增**信任面 ——
-   `docker.sock` 本身就是那个权限。但别让"控制面跑在容器里"听起来像隔离：
-   [ARCHITECTURE §五](../../docs/ARCHITECTURE.md) 那条禁令说的是**实例**，不是控制面。
-   见 [D35](../../docs/DECISIONS.md)。
+1. **节点服务仍等价宿主 root。** 生产 Compose 将 Docker socket、数据池、`/dev` 和
+   `SYS_ADMIN` 移到 `node-agent`，控制面通过只读挂载目录中的私有 Unix socket 调用受限接口，
+   不再直接持有这些资源；控制面根文件系统只读、drop 全部 capabilities。节点服务无公网监听，
+   不接收任意 Docker 配置或宿主命令，也不挂平台数据库凭据。控制面仍能管理所有实例，
+   因此控制面失陷仍然危险；节点服务的路径、并发恢复和真机部署验收尚未全部完成，不能据此认定生产就绪。
 
 2. **池子由安装脚本在宿主上建，容器里不建。** 容器命名空间里 `mount` 出来的块设备，
    宿主和 Docker daemon 都看不见 —— 实例 bind 时会解析到空目录，而容器里的探针**还是成功的**。
    所以 `instance/pool.ts` 在 `DSH_CONTAINERIZED=1` 时，只要 `HOST_STORAGE_ROOT` 不是
    XFS + `pquota` 就**直接拒绝启动**，不尝试建池。
+
+首次引导保存后由控制面自行退出、Compose 重启策略重新启动，不需要 Docker 权限。
+SSH 域名恢复命令接受 `<工作空间父域> [控制台域名]`；保存后须在宿主执行
+`docker compose -f /opt/dsh-cloud/prod.yml restart control-plane`。域名命令不再持有重启其他容器的权限。
+
+节点服务由入口脚本持有数据池 `.dsh-node.lock` 的 `flock` 排他锁，冲突退出码为 75。
+不要删除锁文件来强行启动第二个节点，也不要绕过镜像入口直接启动节点进程。
+进程退出由内核释放锁；锁文件存在本身不表示服务仍在运行。Linux 实际争锁与重启行为仍需部署验收。

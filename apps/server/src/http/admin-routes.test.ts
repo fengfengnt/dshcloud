@@ -183,6 +183,23 @@ describe('平台管理面：每条路由都必须过 admin 钩子', () => {
     expect(syncImages).not.toHaveBeenCalled()
     expect(pullImageStream).not.toHaveBeenCalled()
   })
+
+  it('普通账号不能用请求体和身份头把自己提升为管理员', async () => {
+    const setRole = vi.fn(async () => 'ok' as const)
+    const { app } = await build(USER, { setRole })
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/admin/users/${USER.id}/role`,
+      headers: {
+        'x-user-role': 'admin',
+        'x-user-id': ADMIN.id,
+        'x-platform-instance': 'admin',
+      },
+      payload: { role: 'admin', userId: ADMIN.id },
+    })
+    expect(res.statusCode).toBe(403)
+    expect(setRole).not.toHaveBeenCalled()
+  })
 })
 
 describe('平台管理面：管理员路径', () => {

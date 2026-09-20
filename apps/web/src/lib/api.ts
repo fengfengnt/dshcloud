@@ -580,9 +580,11 @@ export async function getSetupState(): Promise<SetupState> {
 export async function probeSetupDomain(
   token: string,
   baseDomain: string,
-): Promise<{ resolved: boolean; consoleDomain: string }> {
+  consoleDomain?: string,
+): Promise<{ resolved: boolean; consoleDomain: string; workspaceResolved: boolean; consoleResolved: boolean }> {
   const query = new URLSearchParams({ baseDomain })
-  return request<{ resolved: boolean; consoleDomain: string }>(`/api/setup/probe?${query}`, {
+  if (consoleDomain) query.set('consoleDomain', consoleDomain)
+  return request<{ resolved: boolean; consoleDomain: string; workspaceResolved: boolean; consoleResolved: boolean }>(`/api/setup/probe?${query}`, {
     // token 走 header：放 query 里会被服务端原样记进访问日志，而这枚 token 引导期就是唯一凭证
     headers: { 'x-setup-token': token },
   })
@@ -600,6 +602,7 @@ export async function probeSetupDomain(
 export async function submitSetup(body: {
   token: string
   baseDomain: string
+  consoleDomain?: string
   email: string
   password: string
 }): Promise<{ consoleDomain: string; email: string; dns: { probe: string; resolved: boolean } }> {

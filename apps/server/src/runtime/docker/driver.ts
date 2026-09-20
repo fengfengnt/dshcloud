@@ -1,15 +1,17 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { mkdir, rm, stat } from 'node:fs/promises'
+import { lstat, mkdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { promisify } from 'node:util'
 import net from 'node:net'
 import type Docker from 'dockerode'
 import type { InstanceSpec, RenderContext, RenderedInstance } from '@dsh-cloud/instance-spec'
-import { MACHINE_PREFIX, networkName, renderInstance } from '@dsh-cloud/instance-spec'
+import { MACHINE_PREFIX, InstanceSlugSchema, networkName, renderInstance } from '@dsh-cloud/instance-spec'
 import { createDocker, demuxFrames, isNotFound, isNotModified } from '../../docker/client.js'
 import { LXCFS_FILES } from './lxcfs.js'
+import { readBoundedLogs } from './log-reader.js'
+import { instanceSecurityPolicy, RUNTIME_POLICY_VERSION } from './security-policy.js'
 import {
   ProjectRegistry,
   assertStorageKey,
@@ -23,6 +25,7 @@ import {
 import {
   StorageExistsError,
   StorageNotFoundError,
+  StorageIncompleteError,
   type InstanceLiveState,
   type InstanceUsage,
   type RuntimeDriver,
@@ -96,6 +99,37 @@ export class DockerDriver implements RuntimeDriver {
   /** 一个 key 在池子里的目录。**宿主路径不进 spec**（spec 只带不透明的 key）。 */
   private dirOf(key: string): string {
     return join(this.poolRoot, key)
+  }
+
+  private async assertDataDirectory(key: string): Promise<void> {
+    assertStorageKey(key)
+    const info = await lstat(this.dirOf(key)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') throw new StorageNotFoundError(`数据卷 ${key} 不存在`)
+      throw error
+    })
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Instance storage must be a real directory')
+  }
+
+  private async createDataDirectory(key: string): Promise<void> {
+    assertStorageKey(key)
+    // Non-recursive mkdir is exclusive, including when a dangling symlink occupies the name.
+    try { await mkdir(this.dirOf(key), { mode: 0o700 }) } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new StorageExistsError(`数据卷 ${key} 已存在，拒绝覆盖`)
+      }
+      throw error
+    }
+  }
+
+  private async assertStorageStopped(key: string): Promise<void> {
+    const source = this.enforced ? this.dirOf(key) : key
+    const containers = await this.docker.listContainers({ all: true })
+    for (const container of containers) {
+      if (!['running', 'paused', 'restarting'].includes(container.State)) continue
+      if (container.Mounts?.some(mount => mount.Source === source || mount.Name === source)) {
+        throw new Error('Instance storage is in use; stop the workload before modifying data')
+      }
+    }
   }
 
   /**
@@ -198,12 +232,13 @@ export class DockerDriver implements RuntimeDriver {
 
     assertStorageKey(key)
     const dir = this.dirOf(key)
-    if (await pathExists(dir)) {
-      throw new StorageExistsError(`数据卷 ${key} 已存在，拒绝当作新建（数据保护）`)
-    }
-    await mkdir(dir, { recursive: true })
-    const rec = await this.registry!.allocate(key, sizeMb, inodeLimitOf(sizeMb))
+    // Load the registry before adding the first directory to a genuinely empty pool.
+    await this.registry!.keys()
+    await this.createDataDirectory(key)
+    const rec = await this.registry!.allocate(key, sizeMb, inodeLimitOf(sizeMb), true)
     await setProjectQuota(this.poolRoot, dir, rec.projid, rec.sizeMb, rec.inodeLimit)
+    await execFileAsync('sync', ['-f', dir])
+    await this.registry!.complete(key, rec.projid)
   }
 
   /**
@@ -222,15 +257,60 @@ export class DockerDriver implements RuntimeDriver {
       return
     }
     assertStorageKey(key)
-    if (!(await pathExists(this.dirOf(key))) || (await this.registry!.get(key)) === undefined) {
+    await this.assertDataDirectory(key)
+    const record = await this.registry!.get(key)
+    if (record === undefined) {
       throw new StorageNotFoundError(
         `数据卷 ${key} 不存在（拒绝静默新建：那会把「数据丢了」伪装成正常）`,
       )
     }
+    if (record.pending) throw new StorageIncompleteError('Instance storage operation is incomplete; recovery is required')
+  }
+
+  /**
+   * 把这一份数据的属主递归改成 `uid:gid`。见接口上的说明 —— 幂等，且**必须可重入**。
+   *
+   * 两条路径的实现不同，只因为挂载点在哪：池化形态是宿主上的一个目录，控制面自己就能改；
+   * 命名卷的挂载点在 Docker 的虚拟机里，宿主看不见，只能进辅助容器改。
+   */
+  async chownStorage(key: string, uid: number, gid: number): Promise<void> {
+    await this.assertStorageStopped(key)
+    if (!this.enforced) {
+      // **先确认卷在**：`runHelper` 是按卷名挂载的，而 Docker 对不存在的卷名会**默默建一个
+      // 空的**（不像目录那样直接报错）—— 那正好把「数据没了」伪装成「迁移成功」。
+      //
+      // 这条退路还有个坑：**卷是空的**时候，Docker 会在容器起来时把镜像里 `/data` 的属主
+      // 拷进卷里，把这里刚改好的盖掉（2026-09-17 实测）。所以镜像侧的 `/data` 必须已经是
+      // 运行用户的 —— 见 instance-image 的 Dockerfile。这里仍然要做，是为了**已有数据的
+      // 存量卷**：非空 ⇒ 不再被覆盖。
+      await this.ensureStorage(key)
+      await this.runHelper(
+        ['sh', '-c', CHOWN_SCRIPT, 'dsh-chown', HELPER_MOUNT, String(uid), String(gid)],
+        { [key]: HELPER_MOUNT },
+      )
+      return
+    }
+
+    // key 的形状校验只在池化路径上有意义（它拼成宿主路径）；命名卷那边 key 就是卷名，
+    // 与其余几个存储方法保持同一个位置。
+    assertStorageKey(key)
+    const dir = this.dirOf(key)
+    // 幂等快路径：顶层属主已是目标 ⟹ 整棵树都迁完了（这条等价关系由 CHOWN_SCRIPT 的**顺序**
+    // 保证 —— 它最后才动顶层）。走一遍全目录不算贵（同一条升级路径上快照本来就要 `cp -a`
+    // 整个 `/data`），但能省就省。
+    const st = await lstat(dir)
+    if (!st.isDirectory() || st.isSymbolicLink()) {
+      throw new Error(`数据目录 ${key} 不是独立目录，拒绝迁移属主`)
+    }
+    await this.ensureStorage(key)
+    if (st.uid === uid && st.gid === gid) return
+
+    await execFileAsync('sh', ['-c', CHOWN_SCRIPT, 'dsh-chown', dir, String(uid), String(gid)])
   }
 
   /** 删掉这一份数据。幂等。**只删这一个 key** —— 快照由 `DataStore` 按 `.prev` 命名去删。 */
   async removeStorage(key: string): Promise<void> {
+    await this.assertStorageStopped(key)
     if (!this.enforced) {
       try {
         await this.docker.getVolume(key).remove()
@@ -257,7 +337,7 @@ export class DockerDriver implements RuntimeDriver {
    */
   async resizeStorage(key: string, sizeMb: number): Promise<void> {
     if (!this.enforced) return // 命名卷没有限额可改
-    assertStorageKey(key)
+    await this.ensureStorage(key)
     const rec = await this.registry!.get(key)
     if (rec === undefined) throw new StorageNotFoundError(`数据卷 ${key} 不存在，无法改配额`)
     const inodeLimit = inodeLimitOf(sizeMb)
@@ -293,7 +373,8 @@ export class DockerDriver implements RuntimeDriver {
   async storageEnforced(key: string): Promise<boolean> {
     if (!this.enforced) return false
     assertStorageKey(key)
-    return (await this.registry!.get(key)) !== undefined
+    const record = await this.registry!.get(key)
+    return record !== undefined && !record.pending
   }
 
   /**
@@ -324,6 +405,8 @@ export class DockerDriver implements RuntimeDriver {
    * 前提：源已经没有容器在写（调用方 `provisioner.setImage` 保证先停了）。
    */
   async copyStorage(fromKey: string, toKey: string): Promise<void> {
+    await this.assertStorageStopped(fromKey)
+    await this.assertStorageStopped(toKey)
     if (!this.enforced) {
       if (!(await this.volumeExists(fromKey))) {
         throw new StorageNotFoundError(`数据卷 ${fromKey} 不存在，无法复制`)
@@ -339,23 +422,23 @@ export class DockerDriver implements RuntimeDriver {
 
     assertStorageKey(fromKey)
     assertStorageKey(toKey)
+    await this.ensureStorage(fromKey)
     const src = await this.registry!.get(fromKey)
     if (src === undefined) throw new StorageNotFoundError(`数据卷 ${fromKey} 不存在，无法复制`)
     const from = this.dirOf(fromKey)
     const to = this.dirOf(toKey)
-    if (await pathExists(to)) {
-      throw new StorageExistsError(`数据卷 ${toKey} 已存在，拒绝覆盖`)
-    }
-    await mkdir(to, { recursive: true })
-    const rec = await this.registry!.allocate(toKey, src.sizeMb, inodeLimitOf(src.sizeMb))
+    await this.createDataDirectory(toKey)
+    const rec = await this.registry!.allocate(toKey, src.sizeMb, inodeLimitOf(src.sizeMb), true)
     await setProjectQuota(this.poolRoot, to, rec.projid, rec.sizeMb, rec.inodeLimit)
     try {
       await execFileAsync('cp', ['-a', '--sparse=always', `${from}/.`, `${to}/`])
+      await execFileAsync('sync', ['-f', to])
+      await this.registry!.complete(toKey, rec.projid)
     } catch (err) {
-      // 拷到一半失败（多半是配额不够 / ENOSPC）：别留半截目录，连 project 一起清掉。
-      await rm(to, { recursive: true, force: true }).catch(() => undefined)
-      await clearProject(this.poolRoot, rec.projid, to)
-      await this.registry!.release(toKey)
+      // Keep the quota and registry entry if partial data cannot be removed.
+      try { await this.removeStorage(toKey) } catch (cleanupError) {
+        throw new AggregateError([err, cleanupError], 'Storage copy failed and cleanup is incomplete')
+      }
       throw err
     }
   }
@@ -403,7 +486,11 @@ export class DockerDriver implements RuntimeDriver {
   private async ensureNetwork(slug: string): Promise<string> {
     const name = networkName(slug)
     try {
-      await this.docker.getNetwork(name).inspect()
+      const existing = await this.docker.getNetwork(name).inspect()
+      if (existing.Driver !== 'bridge' || existing.Labels?.['dsh.cloud/managed'] !== 'true' ||
+          existing.Labels?.['dsh.cloud/instance'] !== slug) {
+        throw new Error(`网络 ${name} 已存在但归属或驱动不匹配，拒绝接入`)
+      }
       return name
     } catch (err) {
       if (!isNotFound(err)) throw err
@@ -412,6 +499,8 @@ export class DockerDriver implements RuntimeDriver {
       await this.docker.createNetwork({
         Name: name,
         Driver: 'bridge',
+        // Linux interface names are at most 15 bytes. The prefix scopes host rules.
+        Options: { 'com.docker.network.bridge.name': `dshw${createHash('sha256').update(slug).digest('hex').slice(0, 11)}` },
         Labels: { 'dsh.cloud/managed': 'true', 'dsh.cloud/instance': slug },
       })
     } catch (err) {
@@ -428,7 +517,13 @@ export class DockerDriver implements RuntimeDriver {
    */
   private async removeNetwork(slug: string): Promise<void> {
     try {
-      await this.docker.getNetwork(networkName(slug)).remove()
+      const name = networkName(slug)
+      const existing = await this.docker.getNetwork(name).inspect()
+      if (existing.Driver !== 'bridge' || existing.Labels?.['dsh.cloud/managed'] !== 'true' ||
+          existing.Labels?.['dsh.cloud/instance'] !== slug || !existing.Id) {
+        throw new Error(`网络 ${name} 归属或驱动不匹配，拒绝删除`)
+      }
+      await this.docker.getNetwork(existing.Id).remove()
     } catch (err) {
       if (!isNotFound(err)) throw err
     }
@@ -457,7 +552,7 @@ export class DockerDriver implements RuntimeDriver {
       name: r.machineName,
       Image: r.image,
       Env: r.env,
-      Labels: r.labels,
+      Labels: { ...r.labels, 'dsh.cloud/runtime-policy': RUNTIME_POLICY_VERSION },
       User: r.user,
       WorkingDir: r.workingDir,
       ExposedPorts: { [`${r.guestPort}/tcp`]: {} },
@@ -480,6 +575,8 @@ export class DockerDriver implements RuntimeDriver {
         ],
         // 宿主指纹的另一半（lxcfs 管不了的那半）：DMI。见 MASKED_PATHS 的注释。
         MaskedPaths: MASKED_PATHS,
+        // 权限侧的加固。**与 MaskedPaths 分属两件事**：那条管"看得见什么"，这条管"能拿到什么"。
+        ...instanceSecurityPolicy(r.memoryMb),
         // 资源上限来自**渲染结果**（不回去翻 spec）：机器定义里有什么，这里就落什么。
         Memory: r.memoryMb * 1024 * 1024,
         NanoCpus: r.cpus * 1e9,
@@ -496,7 +593,9 @@ export class DockerDriver implements RuntimeDriver {
 
   async start(machineName: string): Promise<void> {
     try {
-      await this.docker.getContainer(machineName).start()
+      const info = await this.ownedContainer(machineName)
+      if (!info) throw new Error('Instance container is missing')
+      await this.docker.getContainer(info.Id).start()
     } catch (err) {
       // 304 = 已经在跑，算成功。
       if (!isNotModified(err)) throw err
@@ -509,7 +608,9 @@ export class DockerDriver implements RuntimeDriver {
    */
   async stop(machineName: string): Promise<void> {
     try {
-      await this.docker.getContainer(machineName).stop({ t: STOP_TIMEOUT_SECONDS })
+      const info = await this.ownedContainer(machineName)
+      if (!info) return
+      await this.docker.getContainer(info.Id).stop({ t: STOP_TIMEOUT_SECONDS })
     } catch (err) {
       // 304 = 已经停了；404 = 不存在。幂等语义下都算成功。
       if (!isNotModified(err) && !isNotFound(err)) throw err
@@ -534,7 +635,9 @@ export class DockerDriver implements RuntimeDriver {
    */
   private async removeContainer(machineName: string): Promise<void> {
     try {
-      await this.docker.getContainer(machineName).remove({ force: true })
+      const info = await this.ownedContainer(machineName)
+      if (!info) return
+      await this.docker.getContainer(info.Id).remove({ force: true })
     } catch (err) {
       if (!isNotFound(err)) throw err
     }
@@ -543,20 +646,36 @@ export class DockerDriver implements RuntimeDriver {
   // ---------------- 观测 ----------------
 
   async status(machineName: string): Promise<InstanceLiveState | undefined> {
-    let info: Docker.ContainerInspectInfo
-    try {
-      info = await this.docker.getContainer(machineName).inspect()
-    } catch (err) {
-      if (isNotFound(err)) return undefined
-      throw err
-    }
+    const info = await this.ownedContainer(machineName)
+    if (!info) return undefined
     const raw = info.State.Status
     return { state: normalizeState(raw), statusText: `docker: ${raw}` }
   }
 
   async listInstanceNames(): Promise<string[]> {
     const list = await this.docker.listContainers({ all: true })
-    return list.flatMap((c) => c.Names ?? []).map((n) => n.replace(/^\//, '')).filter((n) => n.startsWith(MACHINE_PREFIX))
+    return list.filter(c => c.Labels?.['dsh.cloud/managed'] === 'true')
+      .flatMap(c => (c.Names ?? []).map(n => n.replace(/^\//, ''))
+        .filter(n => n === `${MACHINE_PREFIX}${c.Labels['dsh.cloud/instance']}` &&
+          InstanceSlugSchema.safeParse(c.Labels['dsh.cloud/instance']).success))
+  }
+
+  private async ownedContainer(name: string): Promise<Docker.ContainerInspectInfo | undefined> {
+    const slug = name.slice(MACHINE_PREFIX.length)
+    if (!name.startsWith(MACHINE_PREFIX) || !InstanceSlugSchema.safeParse(slug).success) {
+      throw new Error('Invalid instance container name')
+    }
+    try {
+      const info = await this.docker.getContainer(name).inspect()
+      if (!info.Id || info.Name !== `/${name}` || info.Config?.Labels?.['dsh.cloud/managed'] !== 'true' ||
+          info.Config.Labels['dsh.cloud/instance'] !== slug) {
+        throw new Error('Container ownership mismatch')
+      }
+      return info
+    } catch (error) {
+      if (isNotFound(error)) return undefined
+      throw error
+    }
   }
 
   /**
@@ -574,9 +693,14 @@ export class DockerDriver implements RuntimeDriver {
 
   async logs(machineName: string, tail: number): Promise<string> {
     try {
-      const buf = (await this.docker
-        .getContainer(machineName)
-        .logs({ stdout: true, stderr: true, tail })) as unknown as Buffer
+      const info = await this.ownedContainer(machineName)
+      if (!info) return ''
+      const abortSignal = AbortSignal.timeout(5000)
+      const stream = (await this.docker
+        .getContainer(info.Id)
+        .logs({ stdout: true, stderr: true, tail, follow: true,
+          until: new Date().toISOString(), abortSignal })) as Readable
+      const buf = await readBoundedLogs(stream, abortSignal)
       // 没开 TTY 时日志是 8 字节头 + 负载的多路复用帧，直接 toString 会把头混进正文。
       return buf.length >= 8 && buf.subarray(0, 8)[1] !== undefined ? demuxFrames(buf) : buf.toString('utf8')
     } catch (err) {
@@ -586,7 +710,9 @@ export class DockerDriver implements RuntimeDriver {
   }
 
   async exec(machineName: string, argv: string[]): Promise<{ code: number; stdout: string }> {
-    const container = this.docker.getContainer(machineName)
+    const info = await this.ownedContainer(machineName)
+    if (!info) throw new Error('Instance container is missing')
+    const container = this.docker.getContainer(info.Id)
     const exec = await container.exec({
       Cmd: argv,
       AttachStdout: true,
@@ -595,14 +721,16 @@ export class DockerDriver implements RuntimeDriver {
     const stream = (await exec.start({})) as unknown as NodeJS.ReadableStream
     const chunks: Buffer[] = []
     for await (const chunk of stream) chunks.push(Buffer.from(chunk))
-    const info = await exec.inspect()
-    return { code: info.ExitCode ?? 0, stdout: demuxFrames(Buffer.concat(chunks)) }
+    const execution = await exec.inspect()
+    return { code: execution.ExitCode ?? 0, stdout: demuxFrames(Buffer.concat(chunks)) }
   }
 
   /** 容器的 CPU / 内存用量。Docker 原生就有，不需要自己凑。 */
   async stats(machineName: string): Promise<InstanceUsage | undefined> {
     try {
-      const s = (await this.docker.getContainer(machineName).stats({ stream: false })) as unknown as DockerStats
+      const info = await this.ownedContainer(machineName)
+      if (!info) return undefined
+      const s = (await this.docker.getContainer(info.Id).stats({ stream: false })) as unknown as DockerStats
       return { cpuPercent: cpuPercentOf(s), memMb: (s.memory_stats?.usage ?? 0) / 1024 / 1024 }
     } catch (err) {
       if (isNotFound(err)) return undefined
@@ -662,17 +790,31 @@ export class DockerDriver implements RuntimeDriver {
 const HELPER_MOUNT = '/_src'
 const HELPER_TARGET = '/_dst'
 
-const execFileAsync = promisify(execFile)
+/**
+ * 递归改属主的脚本。**两条路径共用一份**（挂载点不同，行为要一模一样）。
+ *
+ * 三段是**有顺序要求**的：先用 `chown -hR` 逐个改顶层下的每一项，**最后**才单独改顶层。
+ * 别改成一句 `chown -R` —— 那样"顶层已经是目标属主"就不再等价于"整棵树都改完了"，而顶层属主
+ * 正是幂等快路径的判据（见 `chownStorage`），半途失败会被当成已完成，然后**静默**留下一个
+ * agent 写不了盘的实例。
+ *
+ * 两点细节：
+ * - `-h`：改符号链接**本身**，不解引用。不加它，一个指向 `/usr` 的软链会让 chown 去改**树外**
+ *   那个文件 —— 而控制面是 root，改得动，那就当场把系统文件改坏了。
+ * - 三个 glob 是"非隐藏 + 隐藏但不含 `.`/`..` + 隐藏且以点开头"的标准写法；`[ -e ] || [ -L ]`
+ *   兜住"目录是空的"这一档（未匹配的 glob 会原样传进来）。
+ */
+const CHOWN_SCRIPT = [
+  'd=$1; u=$2; g=$3',
+  '[ -d "$d" ] && [ ! -L "$d" ] || exit 1',
+  'for e in "$d"/* "$d"/.[!.]* "$d"/..?*; do',
+  '  [ -e "$e" ] || [ -L "$e" ] || continue',
+  '  chown -hR "$u:$g" "$e" || exit 1',
+  'done',
+  'chown -h "$u:$g" "$d"',
+].join('\n')
 
-/** 路径在不在（`stat` 一次）。 */
-async function pathExists(p: string): Promise<boolean> {
-  try {
-    await stat(p)
-    return true
-  } catch {
-    return false
-  }
-}
+const execFileAsync = promisify(execFile)
 
 /**
  * 建实例网络失败的报错。

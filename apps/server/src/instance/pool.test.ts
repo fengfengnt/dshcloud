@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -54,9 +54,10 @@ describe('inodeLimitOf', () => {
 })
 
 describe('assertStorageKey', () => {
-  it('只认平台生成的两种形状', () => {
+  it('只认平台生成的数据、快照和恢复副本标识', () => {
     expect(() => assertStorageKey('a'.repeat(32))).not.toThrow()
     expect(() => assertStorageKey(`${'0'.repeat(31)}f.prev`)).not.toThrow()
+    expect(() => assertStorageKey(`${'a'.repeat(32)}.recovery`)).not.toThrow()
   })
 
   it('别的一律拒绝 —— key 会进 `xfs_quota -c` 的命令字符串', () => {
@@ -210,6 +211,101 @@ describe('ensureStoragePool：判定分支', () => {
 })
 
 describe('ProjectRegistry', () => {
+  it('persists incomplete allocation and only completes the matching project', async () => {
+    const root = await tempDir()
+    const key = 'a'.repeat(32)
+    const registry = new ProjectRegistry(root)
+    const allocated = await registry.allocate(key, 1024, 100, true)
+    const restarted = new ProjectRegistry(root)
+    expect((await restarted.get(key))?.pending).toBe(true)
+    await expect(restarted.complete(key, allocated.projid + 1)).rejects.toThrow('项目编号变化')
+    expect((await registry.get(key))?.pending).toBe(true)
+    await restarted.complete(key, allocated.projid)
+    expect((await new ProjectRegistry(root).get(key))?.pending).toBeUndefined()
+    await restarted.release(key)
+    await expect(restarted.complete(key, allocated.projid)).rejects.toThrow('项目编号变化')
+  })
+  it('新池允许节点创建的空锁文件，但不忽略带内容的异常锁', async () => {
+    const root = await tempDir()
+    const lock = join(root, '.dsh-node.lock')
+    await writeFile(lock, '')
+    expect(await new ProjectRegistry(root).keys()).toEqual(new Set())
+    await rm(join(root, '.dsh-projects.json'))
+    await writeFile(lock, 'unexpected')
+    await expect(new ProjectRegistry(root).keys()).rejects.toThrow('节点锁文件异常')
+  })
+  it('多个注册表对象并发分配不复用编号或覆盖记录', async () => {
+    const root = await tempDir()
+    const first = new ProjectRegistry(root)
+    const second = new ProjectRegistry(root)
+    const keys = Array.from({ length: 12 }, (_, i) => i.toString(16).padStart(32, '0'))
+    const records = await Promise.all(keys.map((key, i) => (i % 2 ? first : second).allocate(key, 1024, 100)))
+    expect(new Set(records.map(record => record.projid)).size).toBe(keys.length)
+    expect(await first.keys()).toEqual(new Set(keys))
+    expect(await second.keys()).toEqual(new Set(keys))
+  })
+  it('写入失败后重新读取磁盘，不暴露未提交的分配记录', async () => {
+    const root = await tempDir()
+    const registry = new ProjectRegistry(root)
+    const key = 'a'.repeat(32)
+    await registry.allocate(key, 1024, 100)
+    const path = join(root, '.dsh-projects.json')
+    const original = await readFile(path, 'utf8')
+    await rm(path)
+    await mkdir(path)
+    await expect(registry.allocate('b'.repeat(32), 1024, 100)).rejects.toThrow()
+    await rm(path, { recursive: true })
+    await writeFile(path, original)
+    expect(await registry.get('b'.repeat(32))).toBeUndefined()
+    expect((await registry.get(key))?.projid).toBe(2)
+  })
+
+  it('注册表写入权限仅限所有者', async () => {
+    const root = await tempDir()
+    await new ProjectRegistry(root).allocate('a'.repeat(32), 1024, 100)
+    expect((await stat(join(root, '.dsh-projects.json'))).mode & 0o777).toBe(0o600)
+  })
+  it('注册表丢失但实例数据仍在时拒绝初始化，并保留数据', async () => {
+    const root = await tempDir()
+    const key = 'a'.repeat(32)
+    await mkdir(join(root, key))
+    await writeFile(join(root, key, 'data'), 'existing')
+    await expect(new ProjectRegistry(root).allocate('b'.repeat(32), 1, 1)).rejects.toThrow('注册表缺失')
+    expect(await readFile(join(root, key, 'data'), 'utf8')).toBe('existing')
+    await expect(stat(join(root, '.dsh-projects.json'))).rejects.toThrow()
+  })
+
+  it('只存在空 lost+found 的新池可以初始化，含恢复文件时不能初始化', async () => {
+    const root = await tempDir()
+    await mkdir(join(root, 'lost+found'))
+    expect(await new ProjectRegistry(root).keys()).toEqual(new Set())
+    await rm(join(root, '.dsh-projects.json'))
+    await writeFile(join(root, 'lost+found', 'recovered'), 'data')
+    await expect(new ProjectRegistry(root).keys()).rejects.toThrow('注册表缺失')
+  })
+  it('同一 key 多次重建后，所有历史编号在重启后仍不可分给别的实例', async () => {
+    const root = await tempDir()
+    const key = 'a'.repeat(32)
+    const ids: number[] = []
+    for (let i = 0; i < 3; i++) {
+      const registry = new ProjectRegistry(root)
+      ids.push((await registry.allocate(key, 1024, 100)).projid)
+      await registry.release(key)
+    }
+    const other = await new ProjectRegistry(root).allocate('b'.repeat(32), 1024, 100)
+    expect(new Set([...ids, other.projid]).size).toBe(4)
+    const raw = JSON.parse(await readFile(join(root, '.dsh-projects.json'), 'utf8'))
+    expect(raw[key].retiredProjids).toEqual(ids.slice(0, -1))
+  })
+
+  it('拒绝重新分配仍有效的 key，保留原配额', async () => {
+    const root = await tempDir()
+    const registry = new ProjectRegistry(root)
+    const key = 'a'.repeat(32)
+    const original = await registry.allocate(key, 1024, 100)
+    await expect(registry.allocate(key, 2048, 200)).rejects.toThrow('拒绝覆盖')
+    expect(await new ProjectRegistry(root).get(key)).toEqual(original)
+  })
   it('从 2 开始分配，并且落盘（新实例读得到）', async () => {
     const root = await tempDir()
     const reg = new ProjectRegistry(root)
@@ -282,14 +378,28 @@ describe('ProjectRegistry', () => {
     expect(raw[key]).toEqual({ projid: 2, sizeMb: 1024, inodeLimit: 100, released: true })
   })
 
-  it('半截 JSON 不该让注册表崩掉（原子写就是为了这个）', async () => {
+  it('半截 JSON 必须阻止分配，不能把旧注册表当空表覆盖', async () => {
     const root = await tempDir()
     await writeFile(join(root, '.dsh-projects.json'), '{"broken":')
 
     const reg = new ProjectRegistry(root)
-    expect(await reg.keys()).toEqual(new Set())
-    // 还能继续用
-    expect((await reg.allocate('9'.repeat(32), 1, 1)).projid).toBe(2)
+    await expect(reg.keys()).rejects.toThrow()
+    await expect(reg.allocate('9'.repeat(32), 1, 1)).rejects.toThrow()
+    expect(await readFile(join(root, '.dsh-projects.json'), 'utf8')).toBe('{"broken":')
+  })
+
+  it.each([
+    { ['a'.repeat(32)]: { projid: 2, sizeMb: 1, inodeLimit: 1 }, ['b'.repeat(32)]: { projid: 2, sizeMb: 1, inodeLimit: 1, released: true } },
+    { ['a'.repeat(32)]: { projid: -1, sizeMb: 1, inodeLimit: 1 } },
+    { '../external': { projid: 2, sizeMb: 1, inodeLimit: 1 } },
+    [],
+  ])('拒绝无效注册表且不覆盖原文件 %#', async raw => {
+    const root = await tempDir()
+    const path = join(root, '.dsh-projects.json')
+    const contents = JSON.stringify(raw)
+    await writeFile(path, contents)
+    await expect(new ProjectRegistry(root).allocate('c'.repeat(32), 1, 1)).rejects.toThrow()
+    expect(await readFile(path, 'utf8')).toBe(contents)
   })
 
   it('同一批分配出来的 id 互不重复', async () => {

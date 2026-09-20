@@ -12,19 +12,18 @@ function source(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   }
 }
 
-describe('CONSOLE_DOMAIN 必须是 BASE_DOMAIN 的子域', () => {
+describe('控制台可使用独立域名', () => {
   it('严格子域放行', () => {
     expect(loadEnv(source()).CONSOLE_DOMAIN).toBe('console.lvh.me')
   })
 
   it('父域本身被拒——父域不当主机名用', () => {
-    expect(() => loadEnv(source({ CONSOLE_DOMAIN: 'lvh.me' }))).toThrow(/子域/)
+    expect(() => loadEnv(source({ CONSOLE_DOMAIN: 'lvh.me' }))).toThrow(/不能.*相同/)
   })
 
-  it('不在父域之下的主机名被拒', () => {
-    // 后缀对、但标签边界不对（`evil-lvh.me` 不是 `lvh.me` 的子域）
+  it('显式配置的独立控制台主机名放行', () => {
     for (const consoleDomain of ['console.other.me', 'evil-lvh.me', 'notlvh.me']) {
-      expect(() => loadEnv(source({ CONSOLE_DOMAIN: consoleDomain })), consoleDomain).toThrow(/子域/)
+      expect(loadEnv(source({ CONSOLE_DOMAIN: consoleDomain })).CONSOLE_DOMAIN).toBe(consoleDomain)
     }
   })
 })
@@ -68,9 +67,12 @@ describe('withPlatformDomains：env 优先 → DB → 都没有才是引导态',
     expect(withPlatformDomains(boot, { baseDomain: '', consoleDomain: '' }).bootstrap).toBe(true)
   })
 
-  it('DB 里那对不成父子 → 当没配（fail closed），不拿它拼 URL', () => {
+  it('数据库同样接受独立控制台域名', () => {
     const r = withPlatformDomains(boot, { baseDomain: 'example.com', consoleDomain: 'console.other.com' })
-    expect(r.bootstrap).toBe(true)
-    expect(r.env.CONSOLE_DOMAIN).toBe('')
+    expect(r.bootstrap).toBe(false)
+    expect(r.env.CONSOLE_DOMAIN).toBe('console.other.com')
+  })
+  it('拒绝数据库中带端口或路径的非法域名', () => {
+    expect(withPlatformDomains(boot, { baseDomain: 'example.com', consoleDomain: 'evil.test/path' }).bootstrap).toBe(true)
   })
 })

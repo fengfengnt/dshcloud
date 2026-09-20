@@ -9,6 +9,7 @@ import { buildApp, type AppDeps } from '../app.js'
  * 「谁认证它、谁授权它」。有副作用的 GET（SSE 之类）尤其要在这里交代清楚。
  */
 const ALLOWED_GET_ROUTES = [
+  'GET /api/workspace/authorize', // Console session + DB owner check; browser transaction binds exchange.
   'GET /auth/verify', // 入口调它判定数据面（Traefik forward-auth）
   'GET /api/auth/*', // better-auth 自己的端点（登录 / 登出 / 会话）
   'GET /healthz', // 存活探针，无数据

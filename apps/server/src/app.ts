@@ -38,7 +38,11 @@ import {
 } from './invitation.js'
 import { demoAccount, trustedOrigins, type Env } from './env.js'
 import { registerAdminRoutes } from './http/admin-routes.js'
+import { expireLegacyCookies } from './http/legacy-cookies.js'
 import { registerForwardAuth } from './http/forward-auth-route.js'
+import { registerWorkspaceAuthorization } from './http/workspace-authorization.js'
+import { issueWorkspaceGrant, resolveWorkspaceSession } from './db/workspace-access-repo.js'
+import { workspaceToken } from './http/workspace-login.js'
 import { registerInvitationRoutes } from './http/invitation-routes.js'
 import { registerSessionRoutes } from './http/session-routes.js'
 import { registerSetupRoutes, type SetupDeps } from './http/setup-routes.js'
@@ -98,10 +102,9 @@ const SETUP_PATH = '/api/setup'
  * 这是**兜底**（那条页面 URL 躲不掉）。能不放 URL 的地方就别放 —— 探测端点因此改用了 header，
  * 见 `http/setup-routes.ts`。
  */
-const TOKEN_IN_QUERY = /([?&]token=)[^&\s]*/giu
-
 export function redactToken(url: string): string {
-  return url.replace(TOKEN_IN_QUERY, '$1<redacted>')
+  const query = url.indexOf('?')
+  return query < 0 ? url : `${url.slice(0, query)}?<redacted>`
 }
 
 /** 照着 Fastify 默认那份写，只把 url 换掉 —— 其余字段（host、来源）排障要用。 */
@@ -122,6 +125,21 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     trustProxy: true,
   })
   await app.register(cookie)
+  app.addHook('onSend', async (request, reply, payload) => {
+    reply.header('x-frame-options', 'DENY')
+    reply.header('content-security-policy', "frame-ancestors 'none'")
+    reply.header('referrer-policy', 'no-referrer')
+    reply.header('x-content-type-options', 'nosniff')
+    if (request.url.startsWith('/api/')) reply.header('cache-control', 'no-store')
+    if (deps.bootstrap || request.headers.host !== deps.env.CONSOLE_DOMAIN) return payload
+    const expired = expireLegacyCookies(request.headers.cookie, deps.env.BASE_DOMAIN, deps.env.PUBLIC_SCHEME === 'https')
+    if (expired.length) {
+      // Fastify appends Set-Cookie values, preserving the authentication response.
+      reply.header('set-cookie', expired)
+      reply.header('cache-control', 'no-store')
+    }
+    return payload
+  })
 
   if (deps.onRoute !== undefined) app.addHook('onRoute', deps.onRoute)
 
@@ -198,16 +216,30 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   })
 
   // ① forward-auth：数据面的门（D8 ②）
+  registerWorkspaceAuthorization(app, {
+    consoleOrigin: `${deps.env.PUBLIC_SCHEME}://${deps.env.CONSOLE_DOMAIN}`,
+    workspaceOrigin: slug => `${deps.env.PUBLIC_SCHEME}://${slug}.${deps.env.BASE_DOMAIN}`,
+    resolveSession: async cookie => {
+      const result = await deps.auth.api.getSession({ headers: fromNodeHeaders({ cookie }) })
+      return result && !result.session.impersonatedBy ? result.session.id : undefined
+    },
+    issue: async input => {
+      const row = await findInstanceBySlug(deps.db, input.slug)
+      return row ? issueWorkspaceGrant(deps.db, { ...input, instanceId: row.id }) : undefined
+    },
+  })
   registerForwardAuth(app, {
     baseDomain: deps.env.BASE_DOMAIN,
     consoleDomain: deps.env.CONSOLE_DOMAIN,
     publicScheme: deps.env.PUBLIC_SCHEME,
     gateSecret: deps.env.PLATFORM_SECRET,
     findInstanceBySlug: (slug) => findInstanceBySlug(deps.db, slug),
-    resolveUserId: (cookieHeader) =>
-      cookieHeader === undefined
-        ? Promise.resolve(undefined)
-        : sessionUser({ cookie: cookieHeader }).then((u) => u?.id),
+    resolveUserId: async (cookieHeader, slug) => {
+      const token = workspaceToken(cookieHeader, deps.env.PUBLIC_SCHEME === 'https')
+      if (!slug || !token) return undefined
+      const row = await findInstanceBySlug(deps.db, slug)
+      return row ? resolveWorkspaceSession(deps.db, token, row.id) : undefined
+    },
   })
 
   // ② 认证端点（better-auth 自己处理登录/登出/会话）

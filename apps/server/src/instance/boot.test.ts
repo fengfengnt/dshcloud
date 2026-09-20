@@ -131,7 +131,16 @@ describe('启动恢复：先校验数据，再拉起实例', () => {
 
     // 判死排在挂载之前，且僵尸行不参与挂载/启动——没人管它才是问题
     expect(events).toEqual(['error:i-zombie', 'ensure:alice', 'start:i-alice'])
-    expect(markError).toHaveBeenCalledWith('i-zombie', '平台重启中断了创建，请重试')
+    expect(markError).toHaveBeenCalledWith('i-zombie', expect.stringContaining('请先检查数据、快照和恢复副本'))
     expect(warn).toHaveBeenCalled()
+  })
+
+  it('preserves interrupted removal without mounting or starting its remaining data', async () => {
+    const { deps, events, markError } = build([
+      row({ slug: 'removing', status: 'removing' }), row({ slug: 'healthy' }),
+    ])
+    await bootInstances(deps)
+    expect(events).toEqual(['error:i-removing', 'ensure:healthy', 'start:i-healthy'])
+    expect(markError).toHaveBeenCalledWith('i-removing', expect.stringContaining('removing'))
   })
 })

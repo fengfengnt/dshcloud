@@ -1,4 +1,9 @@
 import { dirname } from 'node:path'
+import { assertProductionConfig } from './production-config.js'
+import { exchangeWorkspaceGrant, resolveWorkspaceSession, deleteExpiredWorkspaceAccess } from './db/workspace-access-repo.js'
+import { workspaceToken } from './http/workspace-login.js'
+import { createWorkspaceGateway } from './http/workspace-gateway.js'
+import { findInstanceBySlug } from './db/instance-repo.js'
 import { createUserWithPassword } from './account.js'
 import { buildApp } from './app.js'
 import { createAuth } from './auth.js'
@@ -6,7 +11,6 @@ import { createDb } from './db/client.js'
 import { listAllInstances, updateInstance } from './db/instance-repo.js'
 import { deleteMetricsBefore, insertMetric } from './db/metric-repo.js'
 import { getPlatformSetting, savePlatformDomains } from './db/platform-setting-repo.js'
-import { createDocker } from './docker/client.js'
 import { loadEnv, withPlatformDomains } from './env.js'
 import { bootInstances } from './instance/boot.js'
 import { DataStore } from './instance/data-store.js'
@@ -17,11 +21,14 @@ import { InstanceProvisioner } from './instance/provisioner.js'
 import { platformRoutesHttpEntryPoint, projectPlatformRoutes } from './instance/platform-routes.js'
 import { reconcileInstances } from './instance/reconciler.js'
 import { syncRoutesFromInstances } from './instance/routes-sync.js'
-import { ensureStoragePool } from './instance/pool.js'
-import { DockerDriver } from './runtime/docker/driver.js'
-import { LXCFS_FILES, detectLxcfsProc } from './runtime/docker/lxcfs.js'
+import { createLocalRuntime } from './runtime/local.js'
+import { NodeRuntimeDriver } from './runtime/node/client.js'
 
 const parsed = loadEnv()
+assertProductionConfig(parsed, process.env.DSH_CONTAINERIZED === '1' || process.env.NODE_ENV === 'production')
+const production = process.env.DSH_CONTAINERIZED === '1' || process.env.NODE_ENV === 'production'
+const nodeSocket = process.env.DSH_NODE_SOCKET
+if (production && !nodeSocket) throw new Error('Production control plane requires DSH_NODE_SOCKET')
 const { db } = createDb(parsed.DATABASE_URL)
 
 // 域名有两个来源：装机时写在 env 里（**优先**），或引导态里操作者在面板填、落在 DB。
@@ -32,35 +39,48 @@ const { env, bootstrap } = withPlatformDomains(parsed, stored)
 
 const auth = createAuth(env, db, { bootstrap })
 
-// 数据池：实例数据是池子里的目录 + XFS project quota（硬限）。
-//
-// **起不来就别起** —— 池化的隔离是**逻辑隔离**（全靠配额真设上了），而 `xfs_quota limit`
-// 在缺 CAP_SYS_ADMIN 时是**静默失败**。带着"看起来有配额"跑着，比直接报错糟得多。
-const pool = await ensureStoragePool({
-  root: env.HOST_STORAGE_ROOT,
+const driver = nodeSocket ? new NodeRuntimeDriver(nodeSocket) : await createLocalRuntime({
+  root: env.HOST_STORAGE_ROOT, containerized: false, production: false, selfContainer: '',
   ...(env.HOST_POOL_SIZE_MB === undefined ? {} : { sizeMb: env.HOST_POOL_SIZE_MB }),
-  // 平台镜像里 compose 会设它。容器内**只探针和设配额**，不建池 —— 建出来的宿主看不见（D35）。
-  containerized: process.env.DSH_CONTAINERIZED === '1',
 })
-if (!pool.enforced) {
-  console.warn(
-    `⚠️ ${pool.detail}\n` +
-      `   实例数据退回 Docker 命名卷：diskMb 只是**声明值**，不会被强制 —— 界面上的"配额"要标成"无上限"。`,
-  )
-}
-
-// 宿主指纹：宿主装了 lxcfs 时，把它的假文件挂进实例容器，盖掉 `/proc` 里那几个**宿主全局**的数字
-// （内存大小、启动时长、swap 设备）。**探测只在启动时做一次**；缺席是常态，没装的宿主上什么都不做。
-const lxcfsProcDir = await detectLxcfsProc()
-if (lxcfsProcDir !== null) {
-  console.log(`proc 加固：宿主有 lxcfs，实例容器会盖住 ${LXCFS_FILES.join(' / ')}`)
-}
-
-// 运行时驱动是**唯一**接触具体运行时的接口（见 runtime/driver.ts）。
-const driver = new DockerDriver({ pool, ...(lxcfsProcDir === null ? {} : { lxcfsProcDir }) })
+if (driver instanceof NodeRuntimeDriver) await driver.ready()
 const orchestrator = new InstanceOrchestrator(driver, env.INSTANCE_IMAGE_REPO)
 // 数据卷是运行时的概念，原语在驱动上；DataStore 只留策略（见 instance/data-store.ts）。
 const dataStore = new DataStore({ driver })
+
+const gateway = createWorkspaceGateway({
+  baseDomain: env.BASE_DOMAIN, consoleDomain: env.CONSOLE_DOMAIN,
+  publicScheme: env.PUBLIC_SCHEME, gateSecret: env.PLATFORM_SECRET,
+  findInstanceBySlug: slug => findInstanceBySlug(db, slug),
+  findTargetPort: async slug => {
+    const row = await findInstanceBySlug(db, slug)
+    return row && !['provisioning', 'removing', 'stopped'].includes(row.status)
+      ? row.hostPort ?? undefined : undefined
+  },
+  resolveUserId: async (cookie, slug) => {
+    const token = workspaceToken(cookie, env.PUBLIC_SCHEME === 'https')
+    if (!slug || !token) return undefined
+    const row = await findInstanceBySlug(db, slug)
+    return row ? resolveWorkspaceSession(db, token, row.id) : undefined
+  },
+  login: {
+    secure: env.PUBLIC_SCHEME === 'https',
+    consoleOrigin: `${env.PUBLIC_SCHEME}://${env.CONSOLE_DOMAIN}`,
+    exchange: async input => {
+      const row = await findInstanceBySlug(db, input.slug)
+      return row ? exchangeWorkspaceGrant(db, { ...input, instanceId: row.id }) : undefined
+    },
+  },
+})
+const credentialCleanup = setInterval(() => {
+  void deleteExpiredWorkspaceAccess(db).catch(() => console.error('Workspace credential cleanup failed'))
+}, 60_000)
+credentialCleanup.unref()
+await new Promise<void>((resolve, reject) => {
+  gateway.once('error', reject)
+  gateway.listen(0, '127.0.0.1', resolve)
+})
+const gatewayPort = (gateway.address() as import('node:net').AddressInfo).port
 
 const routesConfigPath = process.env.TRAEFIK_ROUTES_PATH ?? '/etc/traefik/dynamic/routes.yml'
 const forwardAuthAddress =
@@ -87,6 +107,7 @@ const syncRoutes = async (): Promise<void> => {
     configPath: routesConfigPath,
     baseDomain: env.BASE_DOMAIN,
     forwardAuthAddress,
+    gatewayAddress: `http://${env.INSTANCE_UPSTREAM_HOST}:${gatewayPort}`,
     upstreamHost: env.INSTANCE_UPSTREAM_HOST,
     entryPoint: env.TRAEFIK_ENTRYPOINT,
     ...(instanceTls === undefined ? {} : { tls: instanceTls }),
@@ -133,12 +154,8 @@ const restartSelf = (): void => {
     console.warn('没配 SELF_CONTAINER，无法自动重启 —— 请手动重启控制面，新域名才会生效。')
     return
   }
-  createDocker()
-    .getContainer(self)
-    .restart()
-    .catch((err: unknown) => {
-      console.warn(`自动重启失败（${messageOf(err)}）—— 请手动重启控制面，新域名才会生效。`)
-    })
+  // The container supervisor restarts us; the public control plane must not own Docker credentials.
+  process.kill(process.pid, 'SIGTERM')
 }
 
 /**
@@ -227,12 +244,17 @@ if (bootstrap) {
   await syncRoutes()
 
   // 外部改动（宿主重启、手动删机器、被 prune）只能靠定时对账收敛
+  let reconciliationPending = false
   reconcileTimer = setInterval(() => {
+    // A long lifecycle operation can hold the queue across many timer ticks.
+    if (reconciliationPending) return
+    reconciliationPending = true
     void healOrphans()
       .then(() => reconcile())
       .catch((err: unknown) => {
         console.warn(`对账失败：${messageOf(err)}`)
       })
+      .finally(() => { reconciliationPending = false })
   }, 45_000)
   // 不 unref 的话进程退不掉、测试也会挂住
   reconcileTimer.unref()
@@ -267,6 +289,8 @@ const shutdown = async (signal: string): Promise<void> => {
   if (reconcileTimer !== undefined) clearInterval(reconcileTimer)
   stopSampler?.()
   await app.close()
+  clearInterval(credentialCleanup)
+  await gateway.shutdown()
   process.exit(0)
 }
 process.on('SIGTERM', () => void shutdown('SIGTERM'))

@@ -1,6 +1,6 @@
 # 架构与安全模型
 
-> 定稿：2026-09-08。本文是 `dsh-cloud` 的架构基准，改了要同步 [DECISIONS.md](DECISIONS.md)。
+> 更新：2026-09-19。认证链路已迁移到外部工作空间网关，完整生产改造尚未完成。当前证据见 [PRODUCTION-READINESS.md](PRODUCTION-READINESS.md)，目标见 [PLATFORM-TARGET-DESIGN.md](PLATFORM-TARGET-DESIGN.md)。
 
 ## 一、目标形态
 
@@ -11,11 +11,11 @@
         ┌──────────────────────────────────────────────┐
         │ Traefik（host 网络 · TLS 逐主机签发（D34）） │
         │   ① console.<父域>   → 平台管理面            │
-        │   ② <slug>.<父域>    → 实例 dsh              │
-        │       ↳ forward-auth 中间件                  │
-        │       ↳ 注入 X-Platform-Token                │
+        │   ② <slug>.<父域>    → 外部工作空间网关       │
+        │       ↳ 独立会话 + owner / Origin 校验       │
+        │       ↳ 过滤 Cookie，再转发实例后端          │
         └──────────────────────────────────────────────┘
-               │ 控制面 127.0.0.1:3000    │ 实例 127.0.0.1:<hostPort>
+               │ 控制面 127.0.0.1:3000    │ 网关 → 127.0.0.1:<hostPort>
                ▼                          ▼
     ┌──────────────────────────┐  ┌──────────────────────────────┐
     │ 控制面（host 网络）      │  │ 实例容器 dsh-instance-<slug> │
@@ -26,7 +26,8 @@
                                   │ cpu/mem 有上限 · 磁盘有硬限  │
                                   └──────────────────────────────┘
 
-        （控制面经 docker.sock 用 dockerode 建 / 起停 / 观测实例容器）
+        控制面 → 私有 Unix socket → 节点服务 → Docker / XFS 配额
+        （生产 Compose 已拆分宿主权限；Linux 整机部署验收尚未完成）
 
     ┌───────────────────────────┐
     │ Postgres（bridge dsh-db） │
@@ -61,12 +62,14 @@
 **数据面（打开 dsh）**：
 
 1. 浏览器 → `<slug>.app.example.com`
-2. Traefik forward-auth → 调控制面 `/auth/verify`
-   - 未登录 → 302 到登录页；登录者不是该实例的 owner → 403
-   - 通过 → 注入 `X-Platform-Instance: <slug>` + `X-Platform-Token: HMAC(PLATFORM_SECRET, "dsh-cloud:gate:<slug>")`
-3. Traefik 用 forward-auth 返回的 `Cookie` 替换原请求 cookie，过滤平台会话后转发到实例容器 `:8080`
-4. caddy 校验签名：缺 / 错 → **403**；正确 → `127.0.0.1:3080`
-5. WebSocket / SSE 同链路（forward-auth 对升级请求同样生效；需关缓冲、拉长超时）
+2. Traefik 转到外部工作空间网关。网关当前与控制面同进程、独立回环监听，独立进程拆分尚未完成。
+3. 没有工作空间会话时，网关设置短时 HttpOnly 事务 Cookie，导航到控制台 `/api/workspace/authorize`。控制台读取自己的 host-only 登录 Cookie，数据库检查 owner 与原会话后签发 60 秒一次性授权码。
+4. 网关保留的 `/_dsh_cloud/callback` 验证浏览器事务，原子兑换绑定实例 ID、原会话和回调的授权码，设置独立工作空间 Cookie，再跳回不含授权码的 URL。回调不交给用户容器。
+5. 后续请求校验工作空间会话、原会话、账号封禁与实例归属；写请求要求精确 Origin，WS 也校验所带 Origin。向实例转发前移除所有平台 Cookie 和伪造转发头；后端父域/保留 Cookie、缓存和嵌入策略由网关过滤或约束。
+6. 网关仍注入每实例门签名，Caddy 校验后转给 dsh。但 Caddy 和 dsh 均不可信，不能用这道检查替代外部网关与宿主网络边界。
+7. WS/SSE 持续连接每 25 秒复查授权，检查超过 5 秒断开；此时限依赖事件循环正常调度，完整浏览器撤权验收仍待完成。
+
+`/auth/verify` 保留兼容代码，现已只认工作空间凭据。生产路由投影默认走网关，不能把旧 forward-auth 测试结果等同于新链路端到端证据。
 
 ## 四、隔离模型：跨实例不可达（Linux 宿主；开发机上有一条例外，见 §一）
 
@@ -111,7 +114,8 @@
   哪天开的机），也能当**跨租户侧信道**（推断邻居的负载、宿主的重启）。宿主装了 lxcfs 能收掉一部分
   （`meminfo` / `uptime` / `swaps`，**宿主侧可选**，见 [SECURITY-HARDENING](SECURITY-HARDENING.md)；
   直接调 `sysinfo(2)` 的程序绕得开它，所以那是降低可读性、不是边界）；
-  `loadavg`（负载没有命名空间）、`cpuinfo`（按 cpuset 假，平台给的是 CPU 配额）、`stat` 的 `btime` 收不掉。
+  `loadavg`（负载没有命名空间）、`cpuinfo`（按 cpuset 假，平台给的是 CPU 配额）、`stat` 的 `btime` **当前**收不掉（内核侧其实有 time namespace + offsets 这条路，是 Docker 没暴露它，
+  见 [ISOLATION-LITERATURE](ISOLATION-LITERATURE.md) §3.2）。
   DMI（宿主是不是虚拟机、机型）由 `MaskedPaths` 遮掉 —— 它与 lxcfs 有无无关，两个运行时都漏
 
 **运行时接缝**：[`apps/server/src/runtime/driver.ts`](../apps/server/src/runtime/driver.ts) 是**唯一**
@@ -125,29 +129,35 @@
 
 | 项 | 现状 |
 |---|---|
-| 用户 | 工作负载跑 **root**（渲染器固定 `user: '0'`，镜像也是 `USER root`）。**没有**容器内降权这一步 —— 曾经的理由（卷归 root + 容器内降不了权）随 microVM 回退一起失效了，见 D29 |
-| rootfs | **可写**（D12：dsh 是编码 agent，装依赖是日常） |
+| 用户 | 工作负载以**固定非 root** 跑（`INSTANCE_UID:GID = 1000:1000`）：渲染器给 `user: '1000:1000'`、镜像 `USER 1000:1000`、宿主上那份数据的属主由**平台侧在建容器之前**递归改（`RuntimeDriver.chownStorage`，`provisioner.applyRuntime` 那个唯一收口点）。容器内降权走不通 —— `setpriv` / `su` 一类在丢能力之后全是 `EPERM`（D29），只能在建容器时由运行时施加。⚠️ 属主不对是**静默失败**：实例照常起、入口照常应，agent 跑到一半才写不了盘。见 D39 |
+| rootfs | 新建/重建实例使用只读根，`/data` 持久可写，`/tmp`、`/run` 使用有限 tmpfs；系统包由镜像预装，真实 dsh 业务兼容仍待验收 |
 | PID 1 | 镜像里的 **tini**（agent 大量 spawn 子进程，必须收僵尸） |
 | 命名空间 / 内核 | **Docker 默认**：进程 / 挂载 / 网络命名空间独立，但**共享宿主内核**（逃逸即宿主失陷）。共享内核的直接后果之一：一批 `/proc` 数字是**宿主全局**的 —— 宿主装了 lxcfs 时，实例里挂上它的 `meminfo` / `uptime` / `swaps`（宿主侧可选，见 [SECURITY-HARDENING](SECURITY-HARDENING.md)）；`loadavg` / `cpuinfo` / `stat` 的 `btime` 盖不住 |
 | 屏蔽表 | `MaskedPaths` = Docker 默认那份（**照抄写死**；两个 daemon 上就不一样：开发机 11 条、真机 dockerd 29.8.0 是 12 条，差一个 `/proc/interrupts`）**+ `/sys/devices/virtual/dmi`**（DMI 写着宿主是不是虚拟机、机型）—— 设了它就是**整份替换**默认值，所以默认那份必须在驱动里抄全，并有用例守着。`ReadonlyPaths` 仍未设（Docker 默认那 5 条生效） |
-| capabilities | ⚠️ **没有 drop** —— 用 Docker 默认能力集（含 CHOWN / DAC_OVERRIDE / SETUID 等，不含 SYS_ADMIN） |
+| capabilities | 新建/重建实例 `CapDrop: ALL`；存量容器需迁移并核验实际状态 |
 | pids 限制 | `HostConfig.PidsLimit = spec.quota.pidsLimit`（默认 512）—— 2026-09-13 才真正接上：此前 schema 里有这个字段、界面上也能调，但驱动没往下带，**改了不生效** |
 | 内存 / CPU | `HostConfig.Memory` / `NanoCpus`（上限而非预留） |
-| `no-new-privileges` / seccomp | ⚠️ **没做**（Docker 默认 seccomp profile 生效，但没有额外收紧） |
+| `no-new-privileges` / seccomp | `no-new-privileges` **已置上**（驱动里的 `SECURITY_OPT`）—— 容器内 setuid 位与文件能力不再提权；与沙箱链**同向**（Landlock 的 `restrict_self` 本来就要求先置 `PR_SET_NO_NEW_PRIVS`）。动态在跑的**存量实例要重建一次**才带得上。seccomp **决定不额外收紧**：继续用 Docker 默认 profile（它已经挡了 `unshare(CLONE_NEWUSER)` 等一批），换取零漂移 —— 见 [ISOLATION-PLAN](ISOLATION-PLAN.md) |
 | 网络 | ① 每实例一个自己的 Docker 网络 `dsh-net-<slug>`（D37）—— 实例之间不同网段、不同广播域；② 桥端口**只发布到宿主回环**（[OPEN-QUESTIONS #4](OPEN-QUESTIONS.md) 实测）。⚠️ 容器仍够得到宿主上绑**非回环**地址的服务（INPUT 路径），要挡得靠宿主侧规则：`install.sh --harden-host`（可选，默认不写） |
 | `--privileged` | **没用**，也不该用（那等于宿主 root） |
 
 > **与 D29 / D30 冲突时以本表为准。** 那两条 ADR 写的是 microVM 回退**之前**的配置
 > （`CapDrop: ALL`、`no-new-privileges`、`MaskedPaths` / `ReadonlyPaths` 覆盖）。切回 Docker 时
-> `CapDrop` 与 `no-new-privileges` 丢了、现在也没设；`MaskedPaths` 自 2026-09-16 起重新设上
-> （默认 12 条 + DMI，见上表），`ReadonlyPaths` 仍未设。实测记录在
+> 这三项都丢了；此后逐项补回 —— `MaskedPaths` 自 2026-09-16 起设上（默认 12 条 + DMI，见上表），
+> `no-new-privileges` 与**非 root + 存储属主迁移**自 2026-09-17 起落定。**`CapDrop` 与 `ReadonlyPaths` 仍未设**（补齐顺序见
+> [ISOLATION-PLAN](ISOLATION-PLAN.md)）。实测记录在
 > [RUNTIME-CONTAINER-EVAL](RUNTIME-CONTAINER-EVAL.md) 的「订正」。
+
+> 批 1 里已落地的两项（`no-new-privileges`、非 root + 存储属主迁移）都**还没在真机上跑过完整流程**
+> （起实例 → 装包 → 跑命令 → 快照）—— 加固类改动的典型
+> 事故是静默坏，所以"代码落定"与"验收通过"是两件事。验收状态看
+> [ISOLATION-PLAN](ISOLATION-PLAN.md)。
 
 **不随运行时变的**：
 
 - 镜像里 **dsh 自己的进程沙箱**（bubblewrap）照旧 —— 它管的是**实例内部**的进程隔离，
   与跨实例边界是两件事（D28 的立场不变：平台不替用户选沙箱模式）
-- **入口的门**照旧：forward-auth（D8）+ 实例内 Caddy 的 header 校验（纵深防御第二层）
+- **入口边界在容器外**：工作空间网关负责认证、授权和响应过滤，实例内 Caddy header 校验仅为纵深措施。
 ## 六、非运行时的跨实例通道（最容易被漏）
 
 真正的跨实例事故往往不出在运行时，而出在这些地方——每一处都必须带实例维度：
@@ -159,9 +169,9 @@
 
 ## 七、Web 侧的一个陷阱：会话 cookie 作用域
 
-控制台在 `console.app.example.com`（`CONSOLE_DOMAIN`），数据面在 `<slug>.app.example.com`（`BASE_DOMAIN=app.example.com`）。forward-auth 要读 cookie 才能认证子域请求 → cookie 必须覆盖父域（`Domain=.<BASE_DOMAIN>`）→ **但实例子域上跑的是 agent 生成的页面**，它天然能对控制面 API 发带凭据的请求。
+控制台在 `console.app.example.com`，工作空间在 `<slug>.app.example.com`。旧父域 Cookie 方案已被替换：实例页面不应获得控制台会话，独立工作空间会话通过上述授权交换建立。
 
-**已实现**（[`apps/server/src/auth.ts`](../apps/server/src/auth.ts)）：cookie 属性 `HttpOnly` + `Secure`（https 时）+ `SameSite=Lax`，`Domain=.<BASE_DOMAIN>`（**父域**，同时覆盖控制台和实例）；better-auth 校验 `trustedOrigins`（只信 `CONSOLE_DOMAIN` 的 origin，实例子域不在其中）。
+**已实现**（[`apps/server/src/auth.ts`](../apps/server/src/auth.ts)）：HTTPS 控制台 Cookie 使用 `__Host-dsh_cloud.*`，Secure、HttpOnly、SameSite=Lax、Path=/，不设置 Domain；工作空间使用独立 `__Host-dsh_cloud.workspace`。生产启动拒绝 PUBLIC_SCHEME=http。旧名称不再用于登录，访问控制台时过期清除旧父域 Cookie；未访问的浏览器不会自动被清除。
 
 `SameSite=Lax` 不阻止实例子域发出的同站跨源请求。控制面现在统一检查写请求的 `Origin`：只允许平台自身来源和显式配置的精确受信来源，缺失或不匹配一律 403。该检查覆盖认证接口及无请求体的生命周期操作，不依赖 CORS 阻止响应读取。
 
@@ -198,7 +208,7 @@
 
 ## 九、待验证
 
-见 [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md)。WebSocket 握手授权与 cookie 过滤已通过真实 Traefik 集成测试，控制面跨源写请求拒绝已有回归测试。
+见 [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md) 与 [PRODUCTION-READINESS.md](PRODUCTION-READINESS.md)。旧 forward-auth 的 WebSocket 握手授权与 Cookie 过滤已通过真实 Traefik 测试；新网关有本地 HTTP/WS/SSE 和独立数据库测试，尚缺完整真实浏览器联合验收。
 
 **装机与入口的前半段已在真 Linux 主机上验通**（2026-09-14）：零提问安装 → 引导页建管理员并配域名
 → 控制面收回对外端口、Traefik 重投影 → Let's Encrypt 为控制台主机名**签下真证书**（外部 `curl`

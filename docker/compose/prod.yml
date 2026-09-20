@@ -48,36 +48,45 @@ services:
       # 池子由安装脚本在宿主上预置。见 instance/pool.ts 的 containerized。
       DSH_CONTAINERIZED: "1"
       SELF_CONTAINER: dsh-control-plane
+      DSH_NODE_SOCKET: /run/dsh-node/agent.sock
     volumes:
-      # 控制面用它创建 / 观测 / 销毁实例容器
-      - /var/run/docker.sock:/var/run/docker.sock
-      # **同路径** bind：实例容器里的 `/data` 是控制面传过去的宿主路径，
-      # 由 daemon 在宿主上解析。两边路径不一致的话，实例会挂到一个空目录上。
-      - ${HOST_STORAGE_ROOT:-/var/lib/dsh}:${HOST_STORAGE_ROOT:-/var/lib/dsh}
-      # lxcfs 的假 `/proc` 文件。**同路径**只读 bind，理由同上一行：控制面得**看得见**它才知道
-      # 该不该把它挂进实例（探测在启动时做一次，见 runtime/docker/lxcfs.ts）。宿主没装 lxcfs 时
-      # Docker 会把源建成一个空目录 —— 无害，探测因此缺席。
-      - /var/lib/lxcfs:/var/lib/lxcfs:ro
-      # 控制面写、Traefik 读（TRAEFIK_ROUTES_PATH）。两边都是这个容内路径。
+      - dsh-node-socket:/run/dsh-node:ro
       - ./traefik/dynamic:/etc/traefik/dynamic
-      # **设备节点**：`xfs_quota` 要打开的是**设备**（`/dev/loop1` 之类），不是挂载点。
-      # 只给挂载点时它报 `cannot setup path for mount …: No such device or address`
-      # 而且**退出码是 0** —— 实测 2026-09-14（真机、本镜像）。所以池子探针的"读回校验"
-      # 是唯一能发现它的地方；设备不可见就等于配额静默失效。
-      #
-      # 绑**整个 /dev** 而不是 `--device /dev/loopN`：宿主上的池子可能是安装脚本建的
-      # loopback 镜像，而 **loop 编号每次开机都可能变**，prod.yml 又是静态的 —— 钉死编号
-      # 会让平台在重启后随机起不来。控制面本来就等价宿主 root（docker.sock + SYS_ADMIN），
-      # 这条不新增任何权限。
-      - /dev:/dev
-    # 只做**探针与设配额**：`xfs_quota limit` 要它，而它在缺权限时是**静默失败**。
-    # 不用 --privileged —— SYS_ADMIN 是这条路径的最小集。
-    # 说明白：这个 capability 叠加 docker.sock 等于宿主 root。docker.sock 本来就已经是
-    # 宿主 root，所以不新增信任面；ARCHITECTURE §五 那条禁令说的是**实例**，不是控制面。
-    cap_add: [SYS_ADMIN]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m
     depends_on:
       postgres:
         condition: service_healthy
+      node-agent:
+        condition: service_healthy
+
+  node-agent:
+    image: ${DSH_CLOUD_IMAGE:?安装脚本会写进 .env}
+    container_name: dsh-node-agent
+    command: [node-agent]
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      SELF_CONTAINER: dsh-node-agent
+      DSH_NODE_SOCKET: /run/dsh-node/agent.sock
+      HOST_STORAGE_ROOT: ${HOST_STORAGE_ROOT:-/var/lib/dsh}
+      INSTANCE_IMAGE_REPO: ${INSTANCE_IMAGE_REPO:-ghcr.io/eskim2001/dsh-instance}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOST_STORAGE_ROOT:-/var/lib/dsh}:${HOST_STORAGE_ROOT:-/var/lib/dsh}
+      - /var/lib/lxcfs:/var/lib/lxcfs:ro
+      # xfs_quota requires device visibility; loop device numbers can change after reboot.
+      - /dev:/dev
+      - dsh-node-socket:/run/dsh-node
+    cap_add: [SYS_ADMIN]
+    healthcheck:
+      test: [CMD, node, --input-type=module, -e, "import { NodeRuntimeDriver } from './dist/src/runtime/node/client.js'; await new NodeRuntimeDriver('/run/dsh-node/agent.sock').ready();"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
 
   traefik:
     image: traefik:v3.5
@@ -98,3 +107,4 @@ networks:
 
 volumes:
   dsh-pgdata:
+  dsh-node-socket:
