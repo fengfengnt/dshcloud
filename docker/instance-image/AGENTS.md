@@ -106,15 +106,19 @@ function processLaunchToken(owner) {
 ⚠️ **失效是静默的**：事件名或判定逻辑一变，插件加载了却什么都不做，没有任何报错。
 验证手法：起个实例，页面里 grep `__DSH_TRANSPORT__`（带 patch 有、不带没有，实测差 68 字节）。
 
-### 已废弃：`--expose-internals`
+### `--expose-internals` 随 dsh 版本变化
 
 早期 entrypoint 用 `node --expose-internals "$(command -v dsh)" --profile web` 启动，
-理由是「HMR 插件构造时硬校验这个 flag」。**2026-09-12 实测：不需要。**
+理由是「HMR 插件构造时硬校验这个 flag」。**2026-09-12 实测 0.1.5-rc.2：不需要。**
 带与不带都能启动、能出页面、能在真实浏览器里交互。
 
-连带影响（已解除）：那个写法要求 `command -v dsh` 是**一个 JS 文件**；
-npm 的 bin 是指向 JS 的符号链接（满足），pnpm 的是 shell 脚本（`node <sh>` → SyntaxError）。
-**flag 不需要之后，「用 pnpm 装 dsh」也不再受阻。**
+**2026-09-21 实测 0.1.6-alpha.1：再次必须带。**不带时 HMR 服务报
+`--expose-internals is required for HMR service`，实例随即退出；入口因此继续显式用
+`node --expose-internals "$(command -v dsh)" web ...` 启动。
+
+这个写法要求 `command -v dsh` 是**一个 JS 文件**；npm 的 bin 是指向 JS 的符号链接
+（满足），pnpm 的是 shell 脚本（`node <sh>` → SyntaxError）。改用 pnpm 安装 dsh 前，
+必须先给这里加一个稳定的 JS 入口。
 
 ---
 

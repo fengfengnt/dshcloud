@@ -28,6 +28,10 @@ RUN test "$(dsh --version)" = "${DSH_VERSION}" \
 RUN corepack enable pnpm
 
 COPY --from=caddy:2.10-alpine /usr/bin/caddy /usr/local/bin/caddy
+# 官方二进制带 cap_net_bind_service；实例会 cap-drop=ALL + no-new-privileges，保留它反而无法 exec。
+# 桥只监听 8080，不需要特权。普通复制不会保留 security.capability xattr。
+RUN cp /usr/local/bin/caddy /tmp/caddy \
+ && mv /tmp/caddy /usr/local/bin/caddy
 
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY Caddyfile /etc/caddy/Caddyfile

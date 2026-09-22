@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "dshcloud 运行时架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/fengfengnt/dshcloud",
+      "provider": "github",
+      "revision": "14e615e4416a1c66ff22ad3ab006277840301612"
+    },
+    "viewBox": [1370, 760],
+    "views": [
+      { "id": "provision-path", "label": "实例创建主链路", "focus": ["operator", "traefik", "web", "control", "provisioner", "nodeRuntime", "workspace"], "note": "从管理台请求进入控制面，经 Unix Socket 驱动节点创建工作空间。" },
+      { "id": "identity-state", "label": "身份与平台状态", "focus": ["web", "control", "auth", "postgres", "provisioner"], "note": "better-auth 会话保护控制面，Drizzle/PostgreSQL 保存账号和实例状态。" },
+      { "id": "runtime-data", "label": "镜像与持久数据", "focus": ["provisioner", "nodeRuntime", "registry", "workspace", "storage"], "note": "节点运行时拉取允许的镜像，并在启动容器前确保数据卷就绪。" }
+    ]
+  },
+  "components": [
+    { "id": "operator", "type": "external", "label": "平台用户", "sublabel": "浏览器", "pos": [25, 80], "size": [170, 68] },
+    {
+      "id": "traefik", "type": "cloud", "label": "Traefik 入口", "sublabel": "HTTPS · 动态路由", "pos": [25, 350], "size": [170, 68],
+      "sources": [{ "path": "apps/server/src/instance/traefik.ts", "line": 86, "end_line": 131, "label": "动态路由生成" }, { "path": "apps/server/src/instance/routes-sync.ts", "line": 69, "end_line": 92, "label": "路由投影" }]
+    },
+    {
+      "id": "web", "type": "frontend", "label": "React 管理台", "sublabel": "Vite · React Query", "pos": [260, 350], "size": [170, 68],
+      "sources": [{ "path": "apps/web/src/main.tsx", "line": 19, "end_line": 28, "label": "前端入口" }, { "path": "apps/web/src/lib/api.ts", "line": 82, "end_line": 103, "label": "同源 API 客户端" }]
+    },
+    {
+      "id": "control", "type": "backend", "label": "Fastify 控制面", "sublabel": "API · 静态控制台 · Gateway", "pos": [495, 350], "size": [170, 68],
+      "sources": [{ "path": "apps/server/src/index.ts", "line": 27, "end_line": 50, "label": "控制面启动" }, { "path": "apps/server/src/app.ts", "line": 121, "end_line": 175, "label": "Fastify 组装" }, { "path": "apps/server/src/http/workspace-gateway.ts", "line": 25, "end_line": 64, "label": "工作区网关" }]
+    },
+    {
+      "id": "provisioner", "type": "backend", "label": "实例编排器", "sublabel": "配额 · 生命周期 · 路由同步", "pos": [730, 350], "size": [170, 68],
+      "sources": [{ "path": "apps/server/src/http/instance-routes.ts", "line": 209, "end_line": 243, "label": "创建实例 API" }, { "path": "apps/server/src/instance/provisioner.ts", "line": 107, "end_line": 143, "label": "创建流程" }, { "path": "apps/server/src/instance/provisioner.ts", "line": 541, "end_line": 591, "label": "运行时收口" }]
+    },
+    {
+      "id": "nodeRuntime", "type": "backend", "label": "节点运行时", "sublabel": "Unix Socket · DockerDriver", "pos": [965, 350], "size": [170, 68],
+      "sources": [{ "path": "apps/server/src/runtime/node/client.ts", "line": 45, "end_line": 95, "label": "控制面 RPC 客户端" }, { "path": "apps/server/src/runtime/node/main.ts", "line": 16, "end_line": 52, "label": "节点服务入口" }, { "path": "apps/server/src/runtime/node/server.ts", "line": 7, "end_line": 59, "label": "受限运行时 RPC" }]
+    },
+    {
+      "id": "workspace", "type": "cloud", "label": "工作空间实例", "sublabel": "隔离 Docker 容器", "pos": [1200, 350], "size": [145, 68],
+      "sources": [{ "path": "apps/server/src/runtime/docker/driver.ts", "line": 540, "end_line": 591, "label": "容器创建与隔离" }]
+    },
+    {
+      "id": "auth", "type": "security", "label": "better-auth", "sublabel": "会话 Cookie · 管理员角色", "pos": [495, 80], "size": [170, 68],
+      "sources": [{ "path": "apps/server/src/auth.ts", "line": 28, "end_line": 62, "label": "控制面认证" }]
+    },
+    {
+      "id": "postgres", "type": "database", "label": "PostgreSQL", "sublabel": "Drizzle ORM · 平台状态", "pos": [495, 650], "size": [170, 68],
+      "sources": [{ "path": "apps/server/src/db/client.ts", "line": 7, "end_line": 24, "label": "唯一持久化入口" }]
+    },
+    {
+      "id": "registry", "type": "external", "label": "容器镜像仓库", "sublabel": "INSTANCE_IMAGE_REPO", "pos": [965, 650], "size": [170, 68],
+      "sources": [{ "path": "apps/server/src/instance/orchestrator.ts", "line": 69, "end_line": 85, "label": "镜像准入与拉取" }]
+    },
+    {
+      "id": "storage", "type": "database", "label": "实例数据池", "sublabel": "卷 / XFS Project Quota", "pos": [1175, 650], "size": [170, 68],
+      "sources": [{ "path": "apps/server/src/instance/provisioner.ts", "line": 547, "end_line": 563, "label": "先数据后实例" }, { "path": "apps/server/src/runtime/docker/driver.ts", "line": 568, "end_line": 575, "label": "数据挂载" }]
+    }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "控制面", "wraps": ["web", "control", "provisioner", "auth", "postgres"], "pad": 22 },
+    { "kind": "region", "label": "节点运行面", "wraps": ["nodeRuntime", "workspace", "storage"], "pad": 22 }
+  ],
+  "connections": [
+    { "id": "operator-entry", "from": "operator", "to": "traefik", "label": "HTTPS", "variant": "emphasis", "labelAt": [110, 162] },
+    { "id": "entry-console", "from": "traefik", "to": "web", "label": "控制台", "variant": "emphasis" },
+    { "id": "web-api", "from": "web", "to": "control", "label": "同源 API", "variant": "emphasis" },
+    { "id": "control-provision", "from": "control", "to": "provisioner", "label": "编排", "variant": "emphasis" },
+    { "id": "provision-node", "from": "provisioner", "to": "nodeRuntime", "label": "UDS", "variant": "emphasis" },
+    { "id": "node-workspace", "from": "nodeRuntime", "to": "workspace", "label": "创建", "variant": "emphasis" },
+    { "id": "auth-control", "from": "auth", "to": "control", "label": "Session", "variant": "security", "labelAt": [580, 162] },
+    { "id": "control-db", "from": "control", "to": "postgres", "label": "Drizzle", "labelAt": [580, 432] },
+    { "id": "node-registry", "from": "nodeRuntime", "to": "registry", "label": "拉取镜像", "labelAt": [1050, 432] },
+    { "id": "workspace-storage", "from": "workspace", "to": "storage", "label": "持久数据", "fromSide": "bottom", "toSide": "top" }
+  ]
+}

@@ -22,3 +22,6 @@ docker/traefik/certs/
 
 .DS_Store
 *.log
+
+# Archify 浏览器验证产物
+dshcloud.architecture.visual-check.*

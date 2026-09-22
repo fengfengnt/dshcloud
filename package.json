@@ -14,7 +14,7 @@
     "dev:web": "pnpm --filter @dsh-cloud/web dev",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm test:install && pnpm -r test",
-    "test:install": "bash scripts/install.test.sh && node --test scripts/harden-host.test.mjs",
+    "test:install": "bash scripts/install.test.sh && bash docker/instance-image/entrypoint.test.sh && node --test scripts/harden-host.test.mjs",
     "build": "pnpm -r build"
   },
   "devDependencies": {

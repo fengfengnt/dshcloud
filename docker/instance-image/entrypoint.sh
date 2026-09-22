@@ -15,7 +15,7 @@ done
 
 LOG=/tmp/dsh.log
 : > "$LOG"
-dsh web --patch /etc/platform/owns-host.yml \
+node --expose-internals "$(command -v dsh)" web --patch /etc/platform/owns-host.yml \
   --host 127.0.0.1 --port "$DSH_PORT" --no-open $TRUSTED > "$LOG" 2>&1 &
 DSH_PID=$!
 
