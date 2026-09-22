@@ -1,4 +1,4 @@
-name: Sync dev to GitLab
+name: Sync dev to GitLab dev-fengfeng
 
 on:
   push:
@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Push dev to GitLab
+      - name: Push dev to GitLab dev-fengfeng
         env:
           GITLAB_SYNC_TOKEN: ${{ secrets.GITLAB_SYNC_TOKEN }}
-        run: git push "http://oauth2:${GITLAB_SYNC_TOKEN}@8.133.188.56:9091/fengfeng/dshcloud.git" HEAD:dev
+        run: git push "http://oauth2:${GITLAB_SYNC_TOKEN}@8.133.188.56:9091/fengfeng/dshcloud.git" HEAD:dev-fengfeng
